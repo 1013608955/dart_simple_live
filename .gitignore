@@ -31,6 +31,7 @@ simple_live_tv_app/.vscode/settings.json
 **/pubspec.lock
 **/android/app/build/
 **/android/.kotlin/
+**/flutter/ephemeral/
 
 # =============================================================================
 # Release outputs & generated workspace data

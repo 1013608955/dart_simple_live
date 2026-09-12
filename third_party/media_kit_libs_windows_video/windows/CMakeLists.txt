@@ -122,11 +122,16 @@ set(LIBMPV_SHA256 "9efd04d351e09eca350d01da1b8b0c406537c037537111ba65ab43c919056
 set(LIBMPV_ARCHIVE "${CMAKE_BINARY_DIR}/${LIBMPV}")
 set(LIBMPV_SRC "${CMAKE_BINARY_DIR}/libmpv")
 set(LIBMPV_MARKER "${LIBMPV_SRC}/.simplelive-${LIBMPV_RELEASE}-${LIBMPV_REVISION}")
+# [LOCAL PATCH 2026-09-12] 本机无法联网下载 mpv 归档，钉死为预取的绝对路径。
+# 插件自身支持 SIMPLE_LIVE_LIBMPV_ARCHIVE 覆盖，这里直接设置绕过下载。
+set(SIMPLE_LIVE_LIBMPV_ARCHIVE "C:/Users/Admin/.openclaw/workspace/simple_live/simple_live_pk/third_party/mpv-dev-x86_64-20260828-git-182fa6ca49.7z")
+
 if(DEFINED SIMPLE_LIVE_LIBMPV_ARCHIVE)
   set(LIBMPV_SHARED_ARCHIVE "${SIMPLE_LIVE_LIBMPV_ARCHIVE}")
 else()
   set(LIBMPV_SHARED_ARCHIVE "${CMAKE_CURRENT_LIST_DIR}/../../${LIBMPV}")
 endif()
+
 
 # Developers and release builders may prefetch this archive once under
 # third_party. Reuse it only after the same checksum validation used for the

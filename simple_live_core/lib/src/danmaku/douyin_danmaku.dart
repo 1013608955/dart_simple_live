@@ -5,6 +5,7 @@ import 'package:simple_live_core/simple_live_core.dart';
 import 'package:simple_live_core/src/common/http_client.dart';
 import 'package:simple_live_core/src/common/web_socket_util.dart';
 import 'package:simple_live_core/src/danmaku/douyin_emoji_assets.dart';
+import 'package:simple_live_core/src/danmaku/douyin_pk.dart';
 import 'package:simple_live_core/src/scripts/douyin_sign.dart';
 
 import 'proto/douyin.pb.dart';
@@ -48,6 +49,199 @@ class DouyinDanmaku implements LiveDanmaku {
   Timer? _flushChatTimer;
   _DouyinImContext? _imContext;
   bool _contextRefreshUsed = false;
+
+  /// 抖音 PK 分数跟踪器（PK 条只在 PK 期间有值）
+  final DouyinPkTracker pkTracker = DouyinPkTracker();
+
+  /// PK 状态变化回调，由 UI 层注册
+  Function(LivePkState state)? onPkState;
+
+  // ---- PK 诊断日志（临时，用于排查"PK条不显示"）----
+  final Set<String> _seenMethods = <String>{};
+  File? _pkLogFile;
+
+  int _pkDumpSeq = 0;
+
+  /// LinkMicMethod 落盘计数（独立限量，避免挤占其他 dump 名额）
+  int _linkmicDumpSeq = 0;
+
+  /// 把 PK 类消息的原始字节落盘，供离线分析 protobuf 字段结构
+  void _pkDumpPayload(String method, List<int> payload) {
+    try {
+      if (_pkDumpSeq >= 60) return; // 限量，避免占盘
+      final dir = Directory('${Directory.systemTemp.path}/pk_dump');
+      dir.createSync(recursive: true);
+      final safe = method.replaceAll(RegExp(r'[^A-Za-z0-9]'), '_');
+      final f = File('${dir.path}/${safe}_$_pkDumpSeq.bin');
+      _pkDumpSeq++;
+      f.writeAsBytesSync(payload, flush: true);
+      _pkDebug("DUMP ${f.path} (${payload.length}B)");
+    } catch (_) {}
+  }
+
+  /// 追加一行到 %TEMP%\simple_live_pk_debug.log；任何异常都吞掉，绝不影响播放
+  void _pkDebug(String line) {
+    try {
+      _pkLogFile ??= File('${Directory.systemTemp.path}/simple_live_pk_debug.log');
+      _pkLogFile!.writeAsStringSync(
+        "${DateTime.now().toIso8601String()} $line\n",
+        mode: FileMode.append,
+      );
+    } catch (_) {}
+  }
+
+  DouyinDanmaku() {
+    // 在构造器里接线，保证无论 UI 是否忘记挂 onPkState，状态都能送达
+    pkTracker.onUpdate = _onPkUpdate;
+  }
+
+  void _onPkUpdate(LivePkState s) {
+    _pkDebug(
+      "STATE count=${s.count} teams=${s.teamScores} "
+      "rawTeam=${pkTracker.debugRawTeamScores} ranks=${pkTracker.debugRanks} "
+      "order=${pkTracker.debugOrder} local=${s.localUserId} "
+      "seat=${pkTracker.debugSeatOrder} nickHint=${pkTracker.debugLocalNickHint} "
+      "nicks=${s.participants.map((p) => '${p.userId}:${p.nickname}').join('|')} "
+      "pip=${s.pipMode} big=${s.bigMode} enl=${s.enlargedUserId} "
+      "seatRoom=${pkTracker.debugSeatRoom} "
+      "roomRes=${pkTracker.debugRoomResolvedCount}/${pkTracker.debugSeatRoom.length} "
+      "hasScores=${s.hasScores} phase=${s.phase} battleId=${s.battleId} "
+      "names=${pkTracker.debugNameCount} profile=${pkTracker.debugProfileCount}",
+    );
+    onPkState?.call(s);
+    _maybeFetchNicknames(s);
+    _maybeResolveSeatRooms();
+  }
+
+  // ---- 对手昵称 HTTP 查询（WS 消息不含昵称，房间详情只有本房名） ----
+  // 每个房间实例每个 uid 只查一次（含失败）；单轮最多查 3 个，防风控
+  final Set<int> _nickFetchDone = <int>{};
+  bool _nickFetchInFlight = false;
+
+  // ---- 座位表房间号 -> uid 解析（linker_map 的值是 room_id 非 uid，
+  // 2026-09-13 三房间实测；reflow 接口按 room_id 查房主 uid+昵称） ----
+  bool _roomResolveInFlight = false;
+
+  /// 主动触发座位表房间号解析。普通连麦时参与者全靠座位表，而座位
+  /// 解析原本只由 PK 状态更新驱动——连麦没战斗消息就永远不触发，
+  /// 名字/礼物值徽章一个都不出（死锁）。UI 层在推完座位表后调用
+  void resolveSeatRooms() => _maybeResolveSeatRooms();
+
+  void _maybeResolveSeatRooms() {
+    if (_roomResolveInFlight) return;
+    final pending = pkTracker.pendingRoomIds;
+    if (pending.isEmpty) return;
+    _roomResolveInFlight = true;
+    () async {
+      try {
+        for (final roomId in pending.take(3)) {
+          final owner = await _fetchRoomOwnerByRoomId(roomId);
+          if (owner != null) {
+            _pkDebug("ROOMRES $roomId -> uid=${owner.$1} nick=${owner.$2}");
+            pkTracker.applyRoomOwner(roomId, owner.$1, owner.$2);
+          } else {
+            _pkDebug("ROOMRES $roomId 查询无结果");
+            pkTracker.applyRoomOwner(roomId, 0, '');
+          }
+        }
+      } catch (e) {
+        _pkDebug("ROOMRES 查询异常: $e");
+      } finally {
+        _roomResolveInFlight = false;
+      }
+    }();
+  }
+
+  /// room_id -> (uid, nickname)（reflow 接口，与 DouyinSite 同端点；
+  /// 接口只需 ttwid cookie，无需 abogus 签名）
+  Future<(int, String)?> _fetchRoomOwnerByRoomId(int roomId) async {
+    final url = 'https://webcast.amemv.com/webcast/room/reflow/info/'
+        '?type_id=0&live_id=1&room_id=$roomId&sec_user_id='
+        '&version_code=99.99.99&app_id=6383';
+    final bytes = await HttpClient.instance.getBytes(
+      url,
+      header: _socketHeaders(),
+    ).timeout(const Duration(seconds: 8));
+    if (bytes.isEmpty) return null;
+    final obj = jsonDecode(utf8.decode(bytes));
+    if (obj is! Map) return null;
+    final data = obj["data"];
+    if (data is! Map) return null;
+    final room = data["room"];
+    if (room is! Map) return null;
+    final owner = room["owner"];
+    if (owner is! Map) return null;
+    final uid = int.tryParse(
+        owner["id_str"]?.toString() ?? owner["id"]?.toString() ?? '');
+    if (uid == null || uid <= 0) return null;
+    final nick = owner["nickname"]?.toString() ?? '';
+    return (uid, nick);
+  }
+
+
+  void _maybeFetchNicknames(LivePkState s) {
+    if (_nickFetchInFlight) return;
+    final targets = <int>[];
+    for (final p in s.participants) {
+      if (p.userId == 0) continue;
+      if (_nickFetchDone.contains(p.userId)) continue;
+      // 占位符形如 "主播NNN"；已有真名的不查
+      if (!p.nickname.startsWith('主播')) continue;
+      targets.add(p.userId);
+      if (targets.length >= 3) break;
+    }
+    if (targets.isEmpty) return;
+    _nickFetchInFlight = true;
+    () async {
+      try {
+        for (final uid in targets) {
+          _nickFetchDone.add(uid);
+          final nick = await _fetchNicknameByUid(uid);
+          if (nick != null && nick.isNotEmpty) {
+            _pkDebug("NICK $uid -> $nick");
+            pkTracker.applyNicknames({uid: nick});
+          } else {
+            _pkDebug("NICK $uid 查询无结果");
+          }
+        }
+      } catch (e) {
+        _pkDebug("NICK 查询异常: $e");
+      } finally {
+        _nickFetchInFlight = false;
+      }
+    }();
+  }
+
+  /// user_id -> 昵称（aweme 用户主页接口，复用 cookie + abogus 签名）。
+  /// 接口无官方文档，响应结构按常见形态防御性解析，失败返回 null
+  Future<String?> _fetchNicknameByUid(int uid) async {
+    final unsigned = Uri
+        .parse("https://www.douyin.com/aweme/v1/web/user/profile/other/")
+        .replace(queryParameters: {
+          "device_platform": "webapp",
+          "aid": "6383",
+          "channel": "channel_pc_web",
+          "user_id": "$uid",
+        }).toString();
+    final signed = DouyinSign.getAbogusUrlWithMsToken(
+      unsigned,
+      DouyinSite.kDefaultUserAgent,
+      msToken: _cookieValue("msToken"),
+    );
+    final bytes =
+        await HttpClient.instance.getBytes(signed, header: _socketHeaders());
+    if (bytes.isEmpty) return null;
+    final obj = jsonDecode(utf8.decode(bytes));
+    if (obj is Map) {
+      dynamic user = obj["user"];
+      if (user == null && obj["data"] is Map) user = obj["data"]["user"];
+      if (user is Map) {
+        final nick = user["nickname"]?.toString();
+        return (nick == null || nick.isEmpty) ? null : nick;
+      }
+    }
+    return null;
+  }
   static const int _maxChatFlushBatch = 50;
   static const Duration _chatFlushInterval = Duration(milliseconds: 80);
 
@@ -56,6 +250,11 @@ class DouyinDanmaku implements LiveDanmaku {
     final startStopwatch = Stopwatch()..start();
     danmakuArgs = args as DouyinDanmakuArgs;
     _contextRefreshUsed = false;
+    // 本房 internalRoomId：linker_map 座位表里值等于它的条目即本房格
+    final ownRoomId = int.tryParse(danmakuArgs.roomId);
+    if (ownRoomId != null && ownRoomId > 0) {
+      pkTracker.setOwnRoomId(ownRoomId);
+    }
     try {
       _imContext = await _fetchImContext();
     } catch (e) {
@@ -121,15 +320,24 @@ class DouyinDanmaku implements LiveDanmaku {
   }
 
   Map<String, dynamic> _socketHeaders() {
+    // resolveSeatRooms 可能早于 start(args) 触发（控制器 initDanmau 在
+    // start 之前推座位表并主动触发解析），此时 danmakuArgs 尚未初始化
+    //（late），直接读会崩。用兜底头先查，10s 刷新会带完整 cookie 重试
+    String cookie = '';
+    String webRid = '';
+    try {
+      cookie = danmakuArgs.cookie;
+      webRid = danmakuArgs.webRid;
+    } catch (_) {}
     return {
       "Accept": "application/json, text/plain, */*",
       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
       "Cache-Control": "no-cache",
       "Pragma": "no-cache",
       "User-Agent": DouyinSite.kDefaultUserAgent,
-      "Cookie": danmakuArgs.cookie,
+      "Cookie": cookie,
       "Origin": "https://live.douyin.com",
-      "Referer": "https://live.douyin.com/${danmakuArgs.webRid}",
+      "Referer": "https://live.douyin.com/$webRid",
     };
   }
 
@@ -345,8 +553,14 @@ class DouyinDanmaku implements LiveDanmaku {
     if (payloadPackage.needAck && logId != null) {
       sendAck(logId, payloadPackage.internalExt);
     }
+    // 用服务端时间校正本地时钟，保证 PK 倒计时准确
+    pkTracker.syncServerTime(payloadPackage.now.toInt());
     for (var msg in payloadPackage.messagesList) {
       messageCount++;
+      // 诊断：首次见到某 method 时记录（一次性，避免刷屏）
+      if (_seenMethods.add(msg.method)) {
+        _pkDebug("METHOD ${msg.method} payload=${msg.payload.length}B");
+      }
       if (msg.method == 'WebcastChatMessage') {
         final liveMessage = unPackWebcastChatMessage(msg.payload);
         if (liveMessage != null) {
@@ -355,6 +569,50 @@ class DouyinDanmaku implements LiveDanmaku {
         }
       } else if (msg.method == 'WebcastRoomUserSeqMessage') {
         unPackWebcastRoomUserSeqMessage(msg.payload);
+      } else if (msg.method == 'WebcastLinkMicBattleMethod' ||
+          msg.method == 'WebcastLinkMicBattle') {
+        _pkDebug("PK-battle(旧) 收到 payload=${msg.payload.length}B");
+        pkTracker.onBattle(msg.payload);
+      } else if (msg.method == 'WebcastLinkMicArmiesMethod' ||
+          msg.method == 'WebcastLinkMicArmies') {
+        _pkDebug("PK-armies(旧) 收到 payload=${msg.payload.length}B");
+        _pkDumpPayload("armies_${msg.method}", msg.payload);
+        pkTracker.onArmies(msg.payload);
+      } else if (msg.method == 'WebcastLinkMicBattleFinishMethod' ||
+          msg.method == 'WebcastLinkMicBattleFinish') {
+        _pkDebug("PK-finish(旧) 收到 payload=${msg.payload.length}B");
+        pkTracker.onFinish(msg.payload);
+      }
+      // ---- 新协议（2026-09 实测在用）----
+      else if (msg.method == 'WebcastBattleStatusMessage') {
+        _pkDebug("PK2-status 收到 payload=${msg.payload.length}B");
+        pkTracker.onBattleStatus(msg.payload);
+      } else if (msg.method == 'WebcastLinkmicPlayModeUpdateScoreMessage') {
+        _pkDebug("PK2-score 收到 payload=${msg.payload.length}B");
+        pkTracker.onScoreUpdate(msg.payload);
+      } else if (msg.method == 'WebcastLinkMicMethod' ||
+          msg.method == 'LinkMicMethod') {
+        _pkDebug("PK2-sync($msg.method) 收到 payload=${msg.payload.length}B");
+        // 落盘限量 12 份：核对 linked_users 顺序 / battle_rank / 队伍分用
+        if (_linkmicDumpSeq < 12) {
+          _pkDumpPayload("linkmic${_linkmicDumpSeq}_${msg.method}", msg.payload);
+          _linkmicDumpSeq++;
+        }
+        pkTracker.onLinkMicMethod(msg.payload);
+      } else if (msg.method == 'WebcastLinkmicUIMessage') {
+        _pkDumpPayload("ui_${msg.method}", msg.payload);
+        pkTracker.onLinkmicUI(msg.payload);
+      } else if (msg.method == 'WebcastBattleEndPunishMessage') {
+        _pkDebug("PK2-endpunish 收到 payload=${msg.payload.length}B");
+        pkTracker.onBattleEndPunish(msg.payload);
+      } else if (msg.method == 'WebcastLinkmicEnlargeGuestMessage') {
+        _pkDebug("PK2-enlarge 收到 payload=${msg.payload.length}B");
+        _pkDumpPayload("enlarge_${msg.method}", msg.payload);
+        pkTracker.onEnlarge(msg.payload);
+      } else if (isPkLikeMethod(msg.method)) {
+        // 兜底：命中 PK 关键词但未识别的 method 名
+        _pkDebug("PK-未知方法 ${msg.method} payload=${msg.payload.length}B");
+        _pkDumpPayload(msg.method, msg.payload);
       }
     }
     return (messageCount, chatCount);
@@ -534,11 +792,19 @@ class DouyinDanmaku implements LiveDanmaku {
 
   void unPackWebcastRoomUserSeqMessage(List<int> payload) {
     var roomUserSeqMessage = RoomUserSeqMessage.fromBuffer(payload);
-
+    // 观看人数 = 当前观看人数（field 3 total，与抖音网页版口径一致）。
+    // 已证伪的候选：totalUser(7)=热度类大数（小房间 1642 实为 6-7 人）、
+    // online_user_for_anchor(10)=大房间 164 万实为 1.6 万、
+    // total_pv_for_anchor(11)=累计观看 PV
+    final cur = roomUserSeqMessage.total.toInt();
+    final online = int.tryParse(roomUserSeqMessage.onlineUserForAnchor.trim()) ?? 0;
+    final v = cur > 0
+        ? cur
+        : (online > 0 ? online : roomUserSeqMessage.totalUser.toInt());
     onMessage?.call(
       LiveMessage(
         type: LiveMessageType.online,
-        data: roomUserSeqMessage.totalUser.toInt(),
+        data: v,
         color: LiveMessageColor.white,
         message: "",
         userName: "",
@@ -568,6 +834,9 @@ class DouyinDanmaku implements LiveDanmaku {
     onMessage = null;
     onClose = null;
     onReady = null;
+    // PK 状态同步清理，避免下个房间残留旧比分
+    onPkState = null;
+    pkTracker.reset();
     webScoketUtils?.close();
   }
 }

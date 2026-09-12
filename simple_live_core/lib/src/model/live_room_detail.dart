@@ -13,6 +13,15 @@ class LiveRoomDetail {
   /// 用户名
   final String userName;
 
+  /// 主播用户 uid（抖音房间详情 owner.id_str；PK 本房格识别用，其他站点可能为空）
+  final String ownerId;
+
+  /// 连麦座位映射 JSON（position -> uid，抖音 linker_map；PK 格子顺序用）
+  final String linkerMapJson;
+
+  /// 是否处于放大（画中画）布局（linker_detail.enlarge_guest_turn_on_source）
+  final bool enlargeGuest;
+
   /// 头像
   final String userAvatar;
 
@@ -63,6 +72,9 @@ class LiveRoomDetail {
     required this.title,
     required this.cover,
     required this.userName,
+    this.ownerId = '',
+    this.linkerMapJson = '',
+    this.enlargeGuest = false,
     required this.userAvatar,
     required this.online,
     this.introduction,
@@ -87,6 +99,7 @@ class LiveRoomDetail {
       "title": title,
       "cover": cover,
       "userName": userName,
+      "ownerId": ownerId,
       "userAvatar": userAvatar,
       "online": online,
       "introduction": introduction,

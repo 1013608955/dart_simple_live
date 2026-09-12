@@ -611,6 +611,8 @@ class DouyinSite implements LiveSite {
       title: room["title"].toString(),
       cover: roomStatus ? room["cover"]["url_list"][0].toString() : "",
       userName: owner["nickname"].toString(),
+      ownerId: (owner["id_str"] ?? owner["id"] ?? "").toString(),
+      linkerMapJson: json.encode(room["linker_map"] ?? <String, dynamic>{}),
       userAvatar: owner["avatar_thumb"]["url_list"][0].toString(),
       online: roomStatus
           ? asT<int?>(room["room_view_stats"]["display_value"]) ?? 0
@@ -676,6 +678,15 @@ class DouyinSite implements LiveSite {
 
     var owner = roomData["owner"];
 
+    // 无 cookie 的降级响应缺主播 uid：本房识别会失效（1v1 名字左右反、
+    // 队色全粉），这里主动抛错让 getRoomDetailByWebRid 转 HTML 抓取
+    // （页面内嵌数据含完整 owner.id_str，已用浏览器实测确认）
+    final ownerUidRaw =
+        owner?["id_str"] ?? owner?["id"] ?? userData?["id_str"] ?? userData?["id"];
+    if (ownerUidRaw == null || ownerUidRaw.toString().isEmpty) {
+      throw CoreError("抖音房间接口返回缺少主播 uid（降级数据），需转网页抓取");
+    }
+
     var roomStatus = (asT<int?>(roomData["status"]) ?? 0) == 2;
 
     // 主要是为了获取cookie,用于弹幕websocket连接
@@ -687,6 +698,17 @@ class DouyinSite implements LiveSite {
       userName: roomStatus
           ? owner["nickname"].toString()
           : userData["nickname"].toString(),
+      // 本房 uid：优先 room.owner；接口路径的 owner 偶尔缺失，
+      // data["user"] 就是主播资料（含 id_str），无条件作为回退
+      ownerId: ((owner?["id_str"] ?? owner?["id"]) ??
+              (userData?["id_str"] ?? userData?["id"] ?? ""))
+          .toString(),
+      linkerMapJson: json.encode(roomData["linker_map"] ?? <String, dynamic>{}),
+      // 放大（画中画）状态：linker_detail.enlarge_guest_turn_on_source 非 0 视为开启
+      enlargeGuest:
+          (asT<int?>(roomData["linker_detail"]?["enlarge_guest_turn_on_source"]) ??
+                  0) >
+              0,
       userAvatar: roomStatus
           ? owner["avatar_thumb"]["url_list"][0].toString()
           : userData["avatar_thumb"]["url_list"][0].toString(),
@@ -759,6 +781,15 @@ class DouyinSite implements LiveSite {
       userName: roomStatus
           ? owner["nickname"].toString()
           : anchor["nickname"].toString(),
+      // 本房主播 uid（PK 本房格识别：1v1 左侧/真名覆盖/队色都依赖它）
+      ownerId: (owner?["id_str"] ?? owner?["id"] ?? anchor?["id_str"] ?? "")
+          .toString(),
+      // 连麦座位表（位置->uid）：PK 格子顺序的权威来源
+      linkerMapJson: json.encode(room["linker_map"] ?? <String, dynamic>{}),
+      enlargeGuest:
+          (asT<int?>(room["linker_detail"]?["enlarge_guest_turn_on_source"]) ??
+                  0) >
+              0,
       userAvatar: roomStatus
           ? owner["avatar_thumb"]["url_list"][0].toString()
           : anchor["avatar_thumb"]["url_list"][0].toString(),
@@ -949,6 +980,14 @@ class DouyinSite implements LiveSite {
       request: (cookieValue) =>
           _requestRoomDataByApi(webRid, cookieValue: cookieValue),
       hasData: _hasWebRoomData,
+      freshCookie: () async {
+        try {
+          return await _getWebCookie(webRid)
+              .timeout(const Duration(seconds: 5));
+        } catch (_) {
+          return "";
+        }
+      },
     );
 
     if (result is! Map) {
@@ -1024,6 +1063,7 @@ class DouyinSite implements LiveSite {
     required String label,
     required Future<dynamic> Function(String cookieValue) request,
     required bool Function(dynamic result) hasData,
+    Future<String> Function()? freshCookie,
   }) async {
     final customPlaybackCookie = _customPlaybackCookie();
     dynamic result;
@@ -1036,7 +1076,27 @@ class DouyinSite implements LiveSite {
       _logDebug("$label 使用自定义 Cookie 请求失败，使用匿名 ttwid 重试：$error");
       return request(_defaultPlaybackCookie());
     }
-    if (customPlaybackCookie.isEmpty || hasData(result)) {
+    if (hasData(result)) {
+      return result;
+    }
+    // 降级数据（缺 owner.uid/linker_map，夜间风控窗口常见）：用直播间
+    // 页面下发的真实 cookie（ttwid+__ac_nonce+msToken，与弹幕 WS 同源）
+    // 再试一次——浏览器拿到的就是这份数据
+    if (freshCookie != null) {
+      try {
+        final fresh = await freshCookie();
+        if (fresh.isNotEmpty) {
+          final retry = await request(fresh);
+          if (hasData(retry)) {
+            _logDebug("$label 降级数据，页面 Cookie 重试成功");
+            return retry;
+          }
+        }
+      } catch (e) {
+        _logDebug("$label 页面 Cookie 重试失败：$e");
+      }
+    }
+    if (customPlaybackCookie.isEmpty) {
       return result;
     }
     _logDebug("$label 返回空数据，使用匿名 ttwid 重试一次");
@@ -1070,7 +1130,16 @@ class DouyinSite implements LiveSite {
       return false;
     }
     final rooms = data["data"];
-    return rooms is List && rooms.any((room) => room is Map && room.isNotEmpty);
+    // 房间数据必须带 owner.id_str/id：无 cookie 的降级响应会给一个
+    // 缺主播 uid 的残缺版本（PK 本房识别会失效），此时应转 HTML 抓取
+    return rooms is List &&
+        rooms.any((room) {
+          if (room is! Map || room.isEmpty) return false;
+          final owner = room["owner"];
+          if (owner is! Map) return false;
+          final id = owner["id_str"] ?? owner["id"];
+          return id != null && id.toString().isNotEmpty;
+        });
   }
 
   bool _hasReflowRoomData(dynamic result) {

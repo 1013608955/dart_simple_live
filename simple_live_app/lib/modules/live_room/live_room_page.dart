@@ -16,6 +16,7 @@ import 'package:simple_live_app/app/utils.dart';
 import 'package:simple_live_app/modules/live_room/live_room_controller.dart';
 import 'package:simple_live_app/modules/live_room/player/player_controls.dart';
 import 'package:simple_live_app/modules/live_room/widgets/live_contribution_rank_panel.dart';
+import 'package:simple_live_app/modules/live_room/widgets/pk_bar.dart';
 import 'package:simple_live_app/services/live_subtitle_service.dart';
 import 'package:simple_live_app/widgets/keep_alive_wrapper.dart';
 import 'package:simple_live_app/widgets/net_image.dart';
@@ -546,14 +547,6 @@ class LiveRoomPage extends GetView<LiveRoomController> {
                           ),
                   ),
                   AppStyle.hGap4,
-                  TextButton.icon(
-                    style: TextButton.styleFrom(
-                      textStyle: const TextStyle(fontSize: 14),
-                    ),
-                    onPressed: controller.showCurrentFollowTagSheet,
-                    icon: const Icon(Remix.price_tag_3_line),
-                    label: const Text("标签"),
-                  ),
                   const Expanded(child: Center()),
                   TextButton.icon(
                     style: TextButton.styleFrom(
@@ -716,6 +709,41 @@ class LiveRoomPage extends GetView<LiveRoomController> {
           // 自己实现
           wakelock: false,
         ),
+        // 抖音 PK 分数层：只在 PK 期间渲染；IgnorePointer 避免挡住播放器控件。
+        // 不用 Obx 包 player.state：media_kit 状态非 Rx，Obx 会报"无响应式依赖"。
+        // 尺寸通过函数提供器在内部 LayoutBuilder / 每秒 ticker 里获取。
+        if (!pipMode)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: DouyinPkLayer(
+                state: controller.pkState,
+                // 抖音实时观看人数（RoomUserSeq → online），仅抖音站传入；
+                // Rx 在 layer 内部 Obx 里读取，人数刷新只重建覆盖层
+                viewerCount: controller.site.id == Constant.kDouyin
+                    ? controller.online
+                    : null,
+                // 本房主播真名（房间详情 HTTP 接口；WS 消息不含昵称）
+                localNickname: controller.detail.value?.userName ?? '',
+                // 直播间标题（仿网页版顶部胶囊，PK 时下移避让进度条）
+                title: controller.detail.value?.title ?? '',
+                nowMs: () {
+                  final dm = controller.liveDanmaku;
+                  return dm is DouyinDanmaku
+                      ? dm.pkTracker.nowMs
+                      : DateTime.now().millisecondsSinceEpoch;
+                },
+                videoAspectRatioProvider: () {
+                  final w = controller.player.state.width ?? 0;
+                  final h = controller.player.state.height ?? 0;
+                  if (w > 0 && h > 0) return w / h;
+                  // 播放器未上报分辨率时的兜底（部分直播流 media_kit 拿不到 dims）
+                  return controller.isVertical.value ? 9 / 16 : 16 / 9;
+                },
+                scaleModeProvider: () =>
+                    AppSettingsController.instance.scaleMode.value,
+              ),
+            ),
+          ),
         if (!pipMode)
           Obx(
             () => Visibility(
@@ -851,16 +879,6 @@ class LiveRoomPage extends GetView<LiveRoomController> {
                       icon: const Icon(Remix.heart_line),
                       label: const Text("关注"),
                     ),
-            ),
-          ),
-          Expanded(
-            child: TextButton.icon(
-              style: TextButton.styleFrom(
-                textStyle: const TextStyle(fontSize: 14),
-              ),
-              onPressed: controller.showCurrentFollowTagSheet,
-              icon: const Icon(Remix.price_tag_3_line),
-              label: const Text("标签"),
             ),
           ),
           Expanded(

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -41,6 +42,7 @@ import 'package:simple_live_app/widgets/settings/settings_card.dart';
 import 'package:simple_live_app/widgets/settings/settings_switch.dart';
 import 'package:simple_live_app/widgets/status/app_empty_widget.dart';
 import 'package:simple_live_core/simple_live_core.dart';
+import 'package:simple_live_core/src/danmaku/douyin_pk.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:window_manager/window_manager.dart';
@@ -53,6 +55,9 @@ class LiveRoomController extends PlayerController
   final String pRoomId;
   final bool initialDesktopSidePanelCollapsed;
   late LiveDanmaku liveDanmaku;
+
+  /// 抖音 PK 状态（null 表示当前无 PK，UI 层不渲染任何东西）
+  final pkState = Rx<LivePkState?>(null);
   LiveRoomController({
     required this.pSite,
     required this.pRoomId,
@@ -439,6 +444,12 @@ class LiveRoomController extends PlayerController
       categoryParentId: detail.categoryParentId?.trim(),
       categoryParentName: detail.categoryParentName?.trim(),
       categoryPic: detail.categoryPic?.trim(),
+      // PK/连麦字段必须透传：曾因漏掉这三项，应用层把站点层取回的
+      // 本房 uid 和 linker_map 座位表全部清空（OWNERID 恒空、座位表
+      // 恒空、格子顺序只能 uid 兜底的真正根因，2026-09-13 定位）
+      ownerId: detail.ownerId,
+      linkerMapJson: detail.linkerMapJson,
+      enlargeGuest: detail.enlargeGuest,
     );
   }
 
@@ -944,6 +955,19 @@ class LiveRoomController extends PlayerController
               .getRoomDetail(roomId: refreshRoomId)
               .timeout(const Duration(seconds: 8)),
         );
+        // 诊断：详情刷新结果（owner/linker 是否降级），定位座位表缺失层级
+        if (site.id == Constant.kDouyin) {
+          try {
+            final f = File(
+                '${Directory.systemTemp.path}/simple_live_pk_debug.log');
+            f.writeAsStringSync(
+              '${DateTime.now().toIso8601String()} DETAIL owner='
+              '${roomDetail.ownerId.isEmpty ? "(空)" : "有"} '
+              'linker=${roomDetail.linkerMapJson.length > 2 ? "有" : "空"}\n',
+              mode: FileMode.append,
+            );
+          } catch (_) {}
+        }
         if (!_isCurrentLoad(refreshGeneration) ||
             site.id != refreshSiteId ||
             roomId != refreshRoomId) {
@@ -952,7 +976,19 @@ class LiveRoomController extends PlayerController
         final reportedLive = roomDetail.status || roomDetail.isRecord;
         if (reportedLive) {
           _onlineStatusRefreshPolicy.reset();
-          online.value = roomDetail.online;
+          // 抖音：HTTP 的 online 是热度值（如 513），观看人数以弹幕
+          // RoomUserSeq 为准（如 13），不能让它覆盖弹幕值
+          if (site.id != Constant.kDouyin) online.value = roomDetail.online;
+          // 座位表随定时刷新更新（有人进出连麦、放大变化都反映在 linker_map）
+          if (site.id == Constant.kDouyin) {
+            pushSeatMapIfAny(liveDanmaku, linkerMapJson: roomDetail.linkerMapJson);
+            final dm = liveDanmaku;
+            if (dm is DouyinDanmaku) {
+              dm.pkTracker.setPipMode(roomDetail.enlargeGuest);
+              // 新座位数据（有人进出）需要重新解析房间号
+              dm.resolveSeatRooms();
+            }
+          }
           liveStatus.value = true;
           return;
         }
@@ -969,13 +1005,25 @@ class LiveRoomController extends PlayerController
           );
           return;
         }
-        online.value = roomDetail.online;
+        if (site.id != Constant.kDouyin) online.value = roomDetail.online;
         liveStatus.value = false;
         _onlineRefreshTimer?.cancel();
         _onlineRefreshTimer = null;
         _restartSuperChatRefreshTimer();
       } catch (e) {
         _onlineStatusRefreshPolicy.reset();
+        // 诊断：刷新失败写调试日志（444=限流标记，座位表会因此断流）
+        if (site.id == Constant.kDouyin) {
+          try {
+            final f = File(
+                '${Directory.systemTemp.path}/simple_live_pk_debug.log');
+            f.writeAsStringSync(
+              '${DateTime.now().toIso8601String()} DETAIL 刷新失败: '
+              '${e.toString().substring(0, e.toString().length.clamp(0, 120))}\n',
+              mode: FileMode.append,
+            );
+          } catch (_) {}
+        }
         Log.d("刷新${site.name}热度失败: $e");
       } finally {
         if (_isCurrentLoad(refreshGeneration)) {
@@ -1411,6 +1459,93 @@ class LiveRoomController extends PlayerController
     liveDanmaku.onMessage = onWSMessage;
     liveDanmaku.onClose = onWSClose;
     liveDanmaku.onReady = onWSReady;
+    // 抖音：接入 PK 状态（1v1 对比条 / 团战总分与每框分数）
+    final dm = liveDanmaku;
+    if (dm is DouyinDanmaku) {
+      // 关键：pkTracker.onUpdate 已在 DouyinDanmaku 构造器里接到 _onPkUpdate
+      // （STATE 诊断日志），这里只能挂 onPkState，不能覆盖 onUpdate，
+      // 否则诊断链路中断（v7 及之前 STATE 全天缺失就是这个原因）。
+      dm.onPkState = (s) {
+        pkState.value = s;
+        // 诊断：记录播放器分辨率（PK 徽章定位依赖它）
+        try {
+          final f = File(
+              '${Directory.systemTemp.path}/simple_live_pk_debug.log');
+          f.writeAsStringSync(
+            '${DateTime.now().toIso8601String()} '
+            'VIDEO ${player.state.width}x${player.state.height} '
+            'vertical=${isVertical.value}\n',
+            mode: FileMode.append,
+          );
+        } catch (_) {}
+      };
+      // 本房主播 uid（房间详情 owner.id_str）：1v1 左侧/真名覆盖/队伍左右
+      // 都依赖它。WS 的 field 18 不是本房标记（会翻转），勿回退
+      // 原始值直接写进 PK 诊断日志（Log.d 在应用日志里，排查不方便）
+      try {
+        final f = File(
+            '${Directory.systemTemp.path}/simple_live_pk_debug.log');
+        final args = detail.value?.danmakuData;
+        f.writeAsStringSync(
+          '${DateTime.now().toIso8601String()} OWNERID '
+          'raw=${detail.value?.ownerId} '
+          'argsRoomId=${
+              args is DouyinDanmakuArgs ? args.roomId : '?'} '
+          'linkerLen=${detail.value?.linkerMapJson.length ?? 0}\n',
+          mode: FileMode.append,
+        );
+      } catch (_) {}
+      final ownerUid = int.tryParse(detail.value?.ownerId ?? '');
+      if (ownerUid != null && ownerUid > 0) {
+        dm.pkTracker.setLocalUserId(ownerUid);
+      }
+      // 连麦座位表（linker_map，位置->房间号）：格子顺序的权威来源
+      pushSeatMapIfAny(dm);
+      // 普通连麦没有战斗消息驱动状态更新，需主动触发房间号解析，
+      // 否则座位解析死锁、名字/礼物值徽章不出现
+      dm.resolveSeatRooms();
+      // 本房昵称提示：owner uid 缺失时按真名匹配本房格
+      dm.pkTracker.setLocalNicknameHint(detail.value?.userName ?? '');
+      // 放大（画中画）状态随详情加载注入
+      dm.pkTracker.setPipMode(detail.value?.enlargeGuest ?? false);
+    } else {
+      pkState.value = null;
+    }
+  }
+
+  /// 解析房间详情里的连麦座位表（linker_map：位置->room_id）并推给 PK 跟踪器
+  void pushSeatMapIfAny(dynamic dm, {String? linkerMapJson}) {
+    if (dm is! DouyinDanmaku) return;
+    try {
+      final raw = linkerMapJson ?? detail.value?.linkerMapJson ?? '';
+      // 空表也要传：座位表从有到无 = 全员退出连线（跟踪器内有空表守卫，
+      // 从未有座位数据的房间不受影响）
+      var seatMap = <int, int>{};
+      if (raw.isNotEmpty && raw != '{}') {
+        final decoded = json.decode(raw);
+        if (decoded is Map) {
+          decoded.forEach((k, v) {
+            final pos = int.tryParse(k.toString());
+            final rid = int.tryParse(v.toString());
+            if (pos != null && rid != null) seatMap[pos] = rid;
+          });
+        }
+      }
+      if (seatMap.isNotEmpty) {
+        // 诊断：座位表原始值（位置->房间号），核对格子顺序用
+        try {
+          final f = File(
+              '${Directory.systemTemp.path}/simple_live_pk_debug.log');
+          f.writeAsStringSync(
+            '${DateTime.now().toIso8601String()} SEATMAP $raw\n',
+            mode: FileMode.append,
+          );
+        } catch (_) {}
+      }
+      dm.pkTracker.setSeatRoomMap(seatMap);
+    } catch (e) {
+      Log.d("解析 linker_map 失败: $e");
+    }
   }
 
   /// 接收 WebSocket 消息
@@ -1541,6 +1676,9 @@ class LiveRoomController extends PlayerController
         return;
       }
       liveDanmaku = targetSite.liveSite.getDanmaku();
+      // 房间切换：清空上一间的 PK 状态，否则关注列表跳转后，
+      // 旧房间的 PK 条和名字徽章会一直残留（2026-09-13 实测）
+      pkState.value = null;
       _clearContributionRankState();
       _clearSuperChatState();
       _cancelPendingDanmakuTimers();
@@ -1605,7 +1743,9 @@ class LiveRoomController extends PlayerController
       addHistory();
       // 刷新关注状态
       followed.value = DBService.instance.getFollowExist("${site.id}_$roomId");
-      online.value = detail.value!.online;
+      // 抖音：HTTP 的 online 是热度值，观看人数以弹幕 RoomUserSeq 为准，
+      // 进房时先置 0（角标隐藏），等首条 RoomUserSeq 再显示
+      if (site.id != Constant.kDouyin) online.value = detail.value!.online;
       liveStatus.value = detail.value!.status || detail.value!.isRecord;
       _restartSuperChatRefreshTimer();
       _restartOnlineRefreshTimer();
