@@ -578,11 +578,15 @@ class HuyaSite implements LiveSite {
     return 0;
   }
 
+  /// 搜索接口的 start 并非偏移量：start>0 时返回的是"前 start+rows 条"的累积结果，
+  /// 且累计窗口上限只有 40 条。因此固定 start=0，通过 rows 扩大累积窗口，
+  /// 再截取 (page-1)*20 ~ page*20 区间作为当前页。
   @override
   Future<LiveSearchRoomResult> searchRooms(
     String keyword, {
     int page = 1,
   }) async {
+    const pageSize = 20;
     var resultText = await HttpClient.instance.getJson(
       "https://search.cdn.huya.com/",
       queryParameters: {
@@ -593,13 +597,16 @@ class HuyaSite implements LiveSite {
         "v": 4,
         "typ": -5,
         "livestate": 0,
-        "rows": 20,
-        "start": (page - 1) * 20,
+        "rows": page * pageSize,
+        "start": 0,
       },
     );
     var result = json.decode(resultText);
+    var docs = result["response"]["3"]["docs"] as List? ?? const [];
+    // rows 超过服务端上限时 docs 可能不足 page*20 条，skip 不会越界
+    var pageDocs = docs.skip((page - 1) * pageSize);
     var items = <LiveRoomItem>[];
-    for (var item in result["response"]["3"]["docs"]) {
+    for (var item in pageDocs) {
       var cover = item["game_screenshot"].toString();
       if (!cover.contains("?")) {
         cover += "?x-oss-process=style/w338_h190&";
@@ -619,7 +626,8 @@ class HuyaSite implements LiveSite {
       );
       items.add(roomItem);
     }
-    var hasMore = result["response"]["3"]["numFound"] > (page * 20);
+    var hasMore =
+        (result["response"]["3"]["numFound"] as int? ?? 0) > (page * pageSize);
     return LiveSearchRoomResult(hasMore: hasMore, items: items);
   }
 
@@ -628,6 +636,7 @@ class HuyaSite implements LiveSite {
     String keyword, {
     int page = 1,
   }) async {
+    const pageSize = 20;
     var resultText = await HttpClient.instance.getJson(
       "https://search.cdn.huya.com/",
       queryParameters: {
@@ -638,13 +647,15 @@ class HuyaSite implements LiveSite {
         "v": 1,
         "typ": -5,
         "livestate": 0,
-        "rows": 20,
-        "start": (page - 1) * 20,
+        "rows": page * pageSize,
+        "start": 0,
       },
     );
     var result = json.decode(resultText);
+    var docs = result["response"]["1"]["docs"] as List? ?? const [];
+    var pageDocs = docs.skip((page - 1) * pageSize);
     var items = <LiveAnchorItem>[];
-    for (var item in result["response"]["1"]["docs"]) {
+    for (var item in pageDocs) {
       var anchorItem = LiveAnchorItem(
         roomId: item["room_id"].toString(),
         avatar: item["game_avatarUrl180"].toString(),
@@ -653,7 +664,8 @@ class HuyaSite implements LiveSite {
       );
       items.add(anchorItem);
     }
-    var hasMore = result["response"]["1"]["numFound"] > (page * 20);
+    var hasMore =
+        (result["response"]["1"]["numFound"] as int? ?? 0) > (page * pageSize);
     return LiveSearchAnchorResult(hasMore: hasMore, items: items);
   }
 

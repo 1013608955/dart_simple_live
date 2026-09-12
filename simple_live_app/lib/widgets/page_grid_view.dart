@@ -73,6 +73,8 @@ class PageGridView extends StatelessWidget {
                   )
                 : MasonryGridView.count(
                     padding: padding,
+                    controller: pageController.scrollController,
+                    primary: false,
                     itemCount: pageController.list.length,
                     itemBuilder: itemBuilder,
                     crossAxisCount: crossAxisCount,

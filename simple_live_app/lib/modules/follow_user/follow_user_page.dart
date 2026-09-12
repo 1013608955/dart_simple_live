@@ -326,7 +326,7 @@ class FollowUserPage extends GetView<FollowUserController> {
                           mainAxisSpacing: layout.mainAxisSpacing,
                           mainAxisExtent: layout.mainAxisExtent,
                           childAspectRatio: layout.childAspectRatio,
-                          useFixedGrid: true,
+                          useFixedGrid: layout.useFixedGrid,
                           crossAxisCount: layout.crossAxisCount,
                           pageController: controller,
                           firstRefresh: false,
@@ -409,10 +409,13 @@ class FollowUserPage extends GetView<FollowUserController> {
         spacing: 12,
         detailsExtent: FollowUserItem.previewDetailsExtent,
       );
+      // 无封面时卡片内容（头像/名称/徽标/操作行）高度随系统字体缩放和徽标数量
+      // 变化，固定高度会截断底部按钮，改为自适应高度的瀑布流网格。
       final cardExtent =
           showLiveCover ? grid.mainAxisExtent : (mobile ? 210.0 : 222.0);
       return _FollowLayoutSpec(
         itemStyle: FollowUserItemStyle.card,
+        useFixedGrid: showLiveCover,
         crossAxisCount: grid.crossAxisCount,
         mainAxisExtent: cardExtent,
         childAspectRatio: 0.9,
@@ -935,6 +938,9 @@ class _FollowLayoutSpec {
   final double crossAxisSpacing;
   final double mainAxisSpacing;
 
+  /// false 时使用自适应高度的瀑布流网格，mainAxisExtent 不生效。
+  final bool useFixedGrid;
+
   const _FollowLayoutSpec({
     required this.itemStyle,
     required this.crossAxisCount,
@@ -942,5 +948,6 @@ class _FollowLayoutSpec {
     required this.childAspectRatio,
     required this.crossAxisSpacing,
     required this.mainAxisSpacing,
+    this.useFixedGrid = true,
   });
 }
