@@ -780,10 +780,11 @@ class _PkCellBadge extends StatelessWidget {
     if (ffa) {
       pillDecoration = isRank1
           ? BoxDecoration(
+              // 半透金底（约 85% 不透明）：透出视频画面，皇冠更突出
               gradient: const LinearGradient(
                 begin: Alignment.topCenter,
                 end: Alignment.bottomCenter,
-                colors: [Color(0xFFE2D4A4), Color(0xFFCDBB85)],
+                colors: [Color(0xD9E2D4A4), Color(0xD9CDBB85)],
               ),
               borderRadius: BorderRadius.circular(10 * ds),
             )
@@ -809,8 +810,8 @@ class _PkCellBadge extends StatelessWidget {
       rankChip = Icon(Icons.card_giftcard, size: 11 * ds, color: Colors.white);
     } else if (ffa && isRank1) {
       rankChip = SizedBox(
-        width: 17 * ds,
-        height: 14 * ds,
+        width: 18 * ds,
+        height: 15 * ds,
         child: Stack(
           children: [
             Positioned.fill(
@@ -938,7 +939,8 @@ class _PkCellBadge extends StatelessWidget {
   }
 }
 
-/// 三尖皇冠剪影（乱斗第 1 名名次章底），仿抖音原版金色小皇冠
+/// 三尖皇冠剪影（乱斗第 1 名名次章底），仿抖音原版金色小皇冠。
+/// 半透底色上为了保持醒目，加一圈深金描边
 class _CrownPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
@@ -958,6 +960,13 @@ class _CrownPainter extends CustomPainter {
       Paint()
         ..color = const Color(0xFFF5C243)
         ..style = PaintingStyle.fill,
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = const Color(0xFF8A5A00).withOpacity(0.6)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.0,
     );
   }
 
