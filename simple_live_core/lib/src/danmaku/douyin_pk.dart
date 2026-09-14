@@ -558,6 +558,8 @@ class DouyinPkTracker {
   /// 战斗时长（秒）+ 惩罚时长（秒），诊断用
   int get debugDurSec => _nDurSec;
   int get debugPunishSec => _nPunishSec;
+  /// 开始时间戳（毫秒，server 时钟），诊断用
+  int get debugStartMs => _nStartMs;
 
   void reset() {
     _state = null;
