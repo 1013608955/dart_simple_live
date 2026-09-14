@@ -1448,14 +1448,18 @@ class DouyinPkTracker {
     if (changed) _rebuildNew();
   }
 
-  /// PK 战局已结束（惩罚中或战局已结束）且连线已退出：
-  /// 清空参与者并 emit 空状态让 UI 立刻隐藏徽章/条。
-  /// 进入判定的条件：战局已 BattleEnd（服务端发了 endpunish）+ 后续
-  /// LinkMessage 不再带回任何参与者 = 全员退出连线。仅惩罚中（_nPhase==2）
-  /// 或 _battleFinished=true 时清，进行中 PK 不动
+  /// PK 战局已结束且连线已退出：清空参与者并发空状态让 UI 隐藏徽章/条。
+  /// 判定分两段：
+  /// - 惩罚中（_nPhase==2）：不动——保留 60s「PK 结束」读秒阶段和当前
+  ///   徽章位置。2026-09-15 4 人 3v1 实测：放宽到 _nPhase==2 即清后，
+  ///   惩罚阶段服务端发的 LinkMessage 不带回 PK 参与者（仅同步连麦状态），
+  ///   found 不含现存 uid → 立即清空 → 60s 惩罚窗口被砍、徽章位置立刻
+  ///   重洗。退出真发生在惩罚阶段的用户最多多等 30s（SEATMAP 兜底清）
+  /// - 惩罚 60s 已走完（_battleFinished=true）：清，徽章随条一同消失
   void _maybeClearOnLinkExit() {
     if (_nTotals.isEmpty) return;
-    if (_nPhase != 2 && !_battleFinished()) return;
+    if (_nPhase == 2) return; // 惩罚阶段保留窗口
+    if (!_battleFinished()) return; // 进行中不动
     _clearParticipants();
   }
 
@@ -1595,8 +1599,14 @@ class DouyinPkTracker {
     if (parts.isEmpty) {
       // 已无任何参与者：发出空状态让 UI 隐藏徽章/条。
       // 否则退出连线或 PK 整体结束后，名字徽章会一直挂着——
-      // 2026-09-15 实测（柱子🤍vs 扶摇 1v1 退出连线）：parts 为空时
-      // 直接 return，UI 拿不到清屏信号
+      // 2026-09-15 1v1 实测（柱子🤍vs 扶摇）：parts 为空时直接 return，
+      // UI 拿不到清屏信号
+      //
+      // 但 PK 进入惩罚阶段（_nPhase==2）时不能清：此时徽章位置是
+      // 战局最终定格，「PK 结束 60s」倒计时走完才整体消失。
+      // 2026-09-15 4 人 3v1 实测：放宽后 SEATMAP 30s 后空表 → parts
+      // 为空 → 立即清空 → 60s 惩罚窗口被砍、徽章位置立刻重洗
+      if (_nPhase == 2) return;
       _clearParticipants();
       return;
     }
