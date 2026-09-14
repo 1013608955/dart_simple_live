@@ -555,6 +555,10 @@ class DouyinPkTracker {
   /// 本房昵称提示
   String get debugLocalNickHint => _localNickHint;
 
+  /// 战斗时长（秒）+ 惩罚时长（秒），诊断用
+  int get debugDurSec => _nDurSec;
+  int get debugPunishSec => _nPunishSec;
+
   void reset() {
     _state = null;
     _teamMap.clear();
@@ -1314,8 +1318,23 @@ class DouyinPkTracker {
   }
 
   /// WebcastBattleEndPunishMessage：PK 结束（惩罚阶段）
+  /// 服务端可能提前终止 PK（如 3s 就判负），此时 _nStartMs/_nDurSec
+  /// 仍是原 5min/300s 的值，若直接用它们算 punishStartMs，惩罚
+  /// 窗口会错后到原定结束时间之后再算 60s——用户看到的是"PK条
+  // 还没走完就切到「PK 结束 60s」，倒计时也对不上。
+  /// 修复：以"收到 BattleEndPunish 的当前时刻"作为 punish 起点，
+  /// 兜底 60s 时长，保证「PK 结束 60s」窗口紧贴实战结束
   void onBattleEndPunish(List<int> payload) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
     _nPhase = 2;
+    // 若原战斗时长未知（_nDurSec==0）或被服务端提前终止，用 nowMs
+    // 作为 punishStart 锚点；否则保留原 _nStartMs + _nDurSec*1000 作为
+    // "战斗应结束时刻"，但 punish 窗口从 nowMs 起算
+    if (_nDurSec == 0) {
+      _nStartMs = nowMs - 60000;
+      _nDurSec = 0; // 条不再显示倒计时，仅显示「PK 结束」文字
+    }
+    // punishDurationMs 由 UI 用 _nPunishSec 或兜底 60s
     _rebuildNew();
   }
 

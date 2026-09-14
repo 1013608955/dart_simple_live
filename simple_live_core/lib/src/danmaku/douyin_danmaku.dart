@@ -120,6 +120,7 @@ class DouyinDanmaku implements LiveDanmaku {
       "seatRoom=${pkTracker.debugSeatRoom} "
       "roomRes=${pkTracker.debugRoomResolvedCount}/${pkTracker.debugSeatRoom.length} "
       "hasScores=${s.hasScores} phase=${s.phase} battleId=${s.battleId} "
+      "dur=${pkTracker.debugDurSec}s punish=${pkTracker.debugPunishSec}s "
       "names=${pkTracker.debugNameCount} profile=${pkTracker.debugProfileCount}",
     );
     onPkState?.call(s);
