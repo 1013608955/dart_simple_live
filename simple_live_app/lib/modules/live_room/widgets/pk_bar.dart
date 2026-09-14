@@ -812,9 +812,10 @@ List<_PkCell> _layoutCells(LivePkState s) {
       //   4 人 2v2（行优先 2x2）：右列从下往上 [3,1]
       //     2026-09-14 辰曦房实测蓝队 2↔4（右上↔右下）
       //   6 人：从右列下往上绕 [5,4,3,…]（桁菜房第二轮 3↔6）
-      //   8 人 4v4 列优先：靠内列（cell 4/5=画面第3列）从下到上，
-      //     最右列（6/7）从上到下 → [5,4,6,7]
-      //     2026-09-14 实测 2↔5 后还要 3→7→4→3
+      //   8 人 4v4 列优先 4x2：右两列"蛇形"填——col=2 从上往下 (cell 4,5)，
+      //     col=3 从下往上 (cell 7,6)；tB 按参与者顺序填 → queue=[4,6,7,5]
+      //     2026-09-15 春虫虫房 4v4 实测：3↔8、4↔7 互换（视觉编号）=
+      //     queue 改后视觉 [3=艾,4=Unii,7=刘,8=11不] 才匹配抖音实际
       //   其余：格子号升序
       final queue = (n == 4 && teamA.length == 2 && teamB.length == 2)
           ? const [3, 1]
@@ -824,7 +825,7 @@ List<_PkCell> _layoutCells(LivePkState s) {
                     if (!aCells.contains(i)) i,
                 ]
               : (n == 8 && teamA.length == 4 && teamB.length == 4)
-                  ? const [5, 4, 6, 7]
+                  ? const [4, 6, 7, 5]
                   : [
                       for (var i = 0; i < n; i++)
                         if (!aCells.contains(i)) i,

@@ -1026,7 +1026,19 @@ class DouyinPkTracker {
     final r = PbReader(payload);
     r.forEachField((f, w) {
       if (f == 2 && w == 2) {
-        _nBattleIdStr = r.readString();
+        final newId = r.readString();
+        // battleId 切换 = 新一局开始，重置 phase/dur/start（防止上一局
+        // 的 punish/punish 残留导致"刚开就显示惩罚窗口"。
+        // 2026-09-15 8人 4v4 实测：跨局时服务端发的 BattleStatus 带
+        // 旧 phase=punish，让 count=0 时已经停在惩罚阶段
+        if (_nBattleIdStr != null && newId != _nBattleIdStr) {
+          _nPhase = 0;
+          _nDurSec = 0;
+          _nStartMs = 0;
+          _nPunishSec = 0;
+          _nActive = false;
+        }
+        _nBattleIdStr = newId;
         return true;
       }
       if (f == 4 && w == 0) {
