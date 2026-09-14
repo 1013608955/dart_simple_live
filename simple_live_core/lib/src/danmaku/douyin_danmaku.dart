@@ -120,7 +120,7 @@ class DouyinDanmaku implements LiveDanmaku {
       "seatRoom=${pkTracker.debugSeatRoom} "
       "roomRes=${pkTracker.debugRoomResolvedCount}/${pkTracker.debugSeatRoom.length} "
       "hasScores=${s.hasScores} phase=${s.phase} battleId=${s.battleId} "
-      "start=${pkTracker.debugStartMs} dur=${pkTracker.debugDurSec}s punish=${pkTracker.debugPunishSec}s "
+      "start=${pkTracker.debugStartMs} dur=${pkTracker.debugDurSec}s punish=${pkTracker.debugPunishSec}s clockOffset=${pkTracker.debugClockOffsetMs}ms"
       "names=${pkTracker.debugNameCount} profile=${pkTracker.debugProfileCount}",
     );
     onPkState?.call(s);
@@ -569,6 +569,7 @@ class DouyinDanmaku implements LiveDanmaku {
       sendAck(logId, payloadPackage.internalExt);
     }
     // 用服务端时间校正本地时钟，保证 PK 倒计时准确
+    // _pkDebug("CLOCK now=${payloadPackage.now} local=${DateTime.now().millisecondsSinceEpoch} offset_before=${_clockOffsetMs}");
     pkTracker.syncServerTime(payloadPackage.now.toInt());
     for (var msg in payloadPackage.messagesList) {
       messageCount++;
