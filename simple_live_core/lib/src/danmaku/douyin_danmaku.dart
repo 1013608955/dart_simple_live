@@ -65,10 +65,13 @@ class DouyinDanmaku implements LiveDanmaku {
   /// LinkMicMethod 落盘计数（独立限量，避免挤占其他 dump 名额）
   int _linkmicDumpSeq = 0;
 
+  /// LinkmicUI 落盘计数：完整 positions 包较大，不能被 60 条总限挤掉
+  int _uiDumpSeq = 0;
+
   /// 把 PK 类消息的原始字节落盘，供离线分析 protobuf 字段结构
-  void _pkDumpPayload(String method, List<int> payload) {
+  void _pkDumpPayload(String method, List<int> payload, {bool force = false}) {
     try {
-      if (_pkDumpSeq >= 60) return; // 限量，避免占盘
+      if (!force && _pkDumpSeq >= 60) return; // 限量，避免占盘
       final dir = Directory('${Directory.systemTemp.path}/pk_dump');
       dir.createSync(recursive: true);
       final safe = method.replaceAll(RegExp(r'[^A-Za-z0-9]'), '_');
@@ -79,11 +82,22 @@ class DouyinDanmaku implements LiveDanmaku {
     } catch (_) {}
   }
 
-  /// 追加一行到 %TEMP%\simple_live_pk_debug.log；任何异常都吞掉，绝不影响播放
+  /// 追加一行到 %TEMP%\simple_live_pk_debug.log；超过 8MB 自动轮换：
+  /// 旧文件改名为 .1（覆盖更早一份），最多 2 份共 16MB，
+  /// 防长时间观看把 TEMP 撑爆（2026-09-14 实测单文件 150MB+）。
+  /// 任何异常都吞掉，绝不影响播放
   void _pkDebug(String line) {
     try {
       _pkLogFile ??= File('${Directory.systemTemp.path}/simple_live_pk_debug.log');
-      _pkLogFile!.writeAsStringSync(
+      final f = _pkLogFile!;
+      if (f.existsSync() && f.lengthSync() > 8 * 1024 * 1024) {
+        try {
+          final rotated = File('${f.path}.1');
+          if (rotated.existsSync()) rotated.deleteSync();
+          f.renameSync(rotated.path);
+        } catch (_) {}
+      }
+      f.writeAsStringSync(
         "${DateTime.now().toIso8601String()} $line\n",
         mode: FileMode.append,
       );
@@ -100,7 +114,7 @@ class DouyinDanmaku implements LiveDanmaku {
       "STATE count=${s.count} teams=${s.teamScores} "
       "rawTeam=${pkTracker.debugRawTeamScores} ranks=${pkTracker.debugRanks} "
       "order=${pkTracker.debugOrder} local=${s.localUserId} "
-      "seat=${pkTracker.debugSeatOrder} nickHint=${pkTracker.debugLocalNickHint} "
+      "seat=${pkTracker.debugSeatOrder} uiSeat=${pkTracker.debugUiSeat} nickHint=${pkTracker.debugLocalNickHint} "
       "nicks=${s.participants.map((p) => '${p.userId}:${p.nickname}').join('|')} "
       "pip=${s.pipMode} big=${s.bigMode} enl=${s.enlargedUserId} "
       "seatRoom=${pkTracker.debugSeatRoom} "
@@ -600,7 +614,11 @@ class DouyinDanmaku implements LiveDanmaku {
         }
         pkTracker.onLinkMicMethod(msg.payload);
       } else if (msg.method == 'WebcastLinkmicUIMessage') {
-        _pkDumpPayload("ui_${msg.method}", msg.payload);
+        if (_uiDumpSeq < 20) {
+          _pkDumpPayload("ui${_uiDumpSeq}_${msg.method}", msg.payload,
+              force: true);
+          _uiDumpSeq++;
+        }
         pkTracker.onLinkmicUI(msg.payload);
       } else if (msg.method == 'WebcastBattleEndPunishMessage') {
         _pkDebug("PK2-endpunish 收到 payload=${msg.payload.length}B");
@@ -609,6 +627,12 @@ class DouyinDanmaku implements LiveDanmaku {
         _pkDebug("PK2-enlarge 收到 payload=${msg.payload.length}B");
         _pkDumpPayload("enlarge_${msg.method}", msg.payload);
         pkTracker.onEnlarge(msg.payload);
+      } else if (msg.method == 'WebcastLinkMessage' ||
+          msg.method == 'LinkMessage') {
+        // 纯连麦（非 PK）名单事件：供"连线但没开 PK 时显示各主播名字"
+        _pkDebug("LINK 收到 payload=${msg.payload.length}B");
+        _pkDumpPayload("link_${msg.method}", msg.payload);
+        pkTracker.onLinkMessage(msg.payload);
       } else if (isPkLikeMethod(msg.method)) {
         // 兜底：命中 PK 关键词但未识别的 method 名
         _pkDebug("PK-未知方法 ${msg.method} payload=${msg.payload.length}B");

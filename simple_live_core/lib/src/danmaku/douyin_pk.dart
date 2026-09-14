@@ -174,6 +174,20 @@ class LivePkState {
   /// 放大（画中画）布局：本房主播全屏、对手小窗（仅 2 人局）
   final bool pipMode;
 
+  /// 本状态构建时间（毫秒）：UI 判断战局是否已无消息（对方退出、
+  /// 战斗中止）用
+  final int lastUpdateMs;
+
+  /// 是否观测到分数流（user_scores / armie 更新）。PK 进行中进房时
+  /// 不会重播 BattleStatus，durationMs=0（条不显示，要点刷新才出），
+  /// 有分数流即可认定战局进行中（2026-09-14 实测）
+  final bool hasScoreFlow;
+
+  /// participants 顺序已是画面格子序（linker_map 或 LinkmicUI positions）。
+  /// UI 层有此标志时按 index 铺几何，不再按队伍猜测重排
+  /// （2026-09-14 三轮 6 人 3v3 每次换的格子都不同，猜测填格已证伪）
+  final bool hasSeatOrder;
+
   const LivePkState({
     this.battleId = 0,
     this.startTimeMs = 0,
@@ -189,6 +203,9 @@ class LivePkState {
     this.enlargedUserId = 0,
     this.bigMode = false,
     this.pipMode = false,
+    this.lastUpdateMs = 0,
+    this.hasScoreFlow = false,
+    this.hasSeatOrder = false,
   });
 
   int get count => participants.length;
@@ -527,6 +544,9 @@ class DouyinPkTracker {
   /// 座位表原始数据（核对 linker_map 用）
   Map<int, int> get debugSeatOrder => Map.of(_seatOrder);
 
+  /// UI positions 座位表（核对 LinkmicUI 用）
+  Map<int, int> get debugUiSeat => Map.of(_uiSeat);
+
   /// 座位房间号表 + 解析进度（核对 room_id->uid 用）
   Map<int, int> get debugSeatRoom => Map.of(_seatRoomMap);
   int get debugRoomResolvedCount => _roomOwner.length;
@@ -557,10 +577,13 @@ class DouyinPkTracker {
     _ownRoomId = 0;
     _seatEmptyStreak = 0;
     _seatOrder.clear();
+    _uiSeat.clear();
+    _nLastSeen.clear();
     _nBattleIdStr = null;
     _nPhase = 0;
     _nStartMs = 0;
     _nDurSec = 0;
+    _nSawScores = false;
     _nPunishSec = 0;
     _nActive = false;
     _nHasTeamScores = false;
@@ -938,6 +961,15 @@ class DouyinPkTracker {
   int _ownRoomId = 0; // 本房 internalRoomId（弹幕 args.roomId）
   /// 座位表解析成功后的 position -> uid（格子顺序，权威来源）
   final Map<int, int> _seatOrder = <int, int>{};
+
+  /// WebcastLinkmicUIMessage.basic.positions：position -> uid。
+  /// 官方格子序。旧逻辑只在 uid 尚未入 _nOrder 时 insert，PK 房
+  /// user_scores 几乎总是先到，座位被丢掉（2026-09-14 三轮 6 人证伪）
+  final Map<int, int> _uiSeat = <int, int>{};
+
+  /// 手动调整的格子顺序偏移（uidA -> uidB），用于应对抖音无座位表下发的
+  /// 特殊情况，当前战局内持久生效
+  final Map<int, int> _manualSwaps = <int, int>{};
   /// 放大构图确认开启：房间详情 enlarge_guest 标记（定时刷新注入）或
   /// EnlargeGuest 消息。2 人局=全屏+小窗构图，多人=左大格+右侧小格
   bool _nPipMode = false;
@@ -948,18 +980,37 @@ class DouyinPkTracker {
   int _nPhase = 0; // 1=进行中 2=惩罚
   int _nStartMs = 0;
   int _nDurSec = 0;
+  bool _nSawScores = false;
+  final Map<int, int> _nLastSeen = <int, int>{}; // uid -> 最后出现在同步里的时刻
   int _nPunishSec = 0;
   bool _nActive = false;
 
-  /// 回退格子顺序：本房优先（观看的房间通常是 PK 发起方，合成画面
-  /// 首格=发起方），其余按首次入列序（≈挑战者加入顺序）。
-  /// 注意：若本房只是挑战者（车轮战中途加入），真位置无法从现有
-  /// 数据推出，此回退会错位
+  /// 回退格子顺序：本房优先（位于 0 号格）；其余按名次升序
+  /// （名次 1、2、3...），缺名次时按 uid 升序兜底。
+  /// 不能按分值兜底：分值每条消息都在变，会导致绑定抖动
+  /// （2026-09-14 实测刷新后名字分值乱跳而画面没动）。
+  /// 2026-09-14 春虫虫房 4 人乱斗实测：官方构图 = 本房、名次1 在左列，
+  /// 名次3、名次4 在右列（配合 UI 层按列填充）
   List<int> _orderedIds() {
     final ids = _nTotals.keys.toList();
+    int rankOf(int u) => _nRank[u] ?? 0;
+    void sortRest() {
+      ids.sort((a, b) {
+        final ra = rankOf(a);
+        final rb = rankOf(b);
+        if (ra > 0 && rb > 0 && ra != rb) return ra.compareTo(rb);
+        if (ra > 0 && rb == 0) return -1;
+        if (ra == 0 && rb > 0) return 1;
+        return a.compareTo(b); // 都无名次：uid 升序（稳定，不随分值抖）
+      });
+    }
+
     if (_nLocalId != 0 && ids.contains(_nLocalId)) {
       ids.remove(_nLocalId);
+      sortRest();
       ids.insert(0, _nLocalId);
+    } else {
+      sortRest();
     }
     return ids;
   }
@@ -973,7 +1024,11 @@ class DouyinPkTracker {
         return true;
       }
       if (f == 4 && w == 0) {
-        _nPhase = r.readVarint();
+        final p = r.readVarint();
+        // Punish 阶段一旦进入（_nPhase=2），后续 BattleStatus 不覆盖
+        // 直到 60s 读完（2026-09-14 实测：Punish 后第一条同步把
+        // _nPhase 重置为 0，导致 60s 窗口消失）
+        if (_nPhase != 2) _nPhase = p;
         return true;
       }
       if (f == 6 && w == 0) {
@@ -1026,6 +1081,9 @@ class DouyinPkTracker {
 
   /// WebcastLinkMicMethod：总分同步（含队伍分）
   void onLinkMicMethod(List<int> payload) {
+    // 战局已结束后服务端仍会推送带旧分数的同步消息——忽略，
+    // 否则清掉的徽章会被重新加回
+    if (_battleFinished()) return;
     int? score;
     int? uid;
     int? teamScore;
@@ -1109,6 +1167,10 @@ class DouyinPkTracker {
           } else if (tr != null && tr != 0) {
             _nAnchorTeam[u] = tr!;
           }
+          // 记录首次出现顺序作为格子顺序（WS 数组每条消息顺序随机打散，
+          // 但同一个 uid 只在第一次出现时入队；2026-09-14 实测 8 人局
+          // 必须按此顺序才与抖音合成画面位置一致）
+          if (!_nOrder.contains(u)) _nOrder.add(u);
         }
         score = null;
         uid = null;
@@ -1119,17 +1181,59 @@ class DouyinPkTracker {
       }
       return false;
     });
-    // 全量同步的 user_scores 未包含的 uid = 已退出 PK 的主播，剔除
-    // （2026-09-12 实测 8 人局退出 1 人后徽章残留 8 个）
-    if (scoreUids.length >= 2) {
-      _nTotals.removeWhere((u, _) => !scoreUids.contains(u));
-      _nRank.removeWhere((u, _) => !scoreUids.contains(u));
-      _nTeamScore.removeWhere((u, _) => !scoreUids.contains(u));
-      _nAnchorTeam.removeWhere((u, _) => !scoreUids.contains(u));
-      _nNames.removeWhere((u, _) => !scoreUids.contains(u));
-      _nOrder.removeWhere((u) => !scoreUids.contains(u));
+    // 明确收到"只有连麦名单、无任何分数"：战局已退回纯连麦。
+    // 但惩罚阶段（_nPhase==2）不清——主倒计时一结束服务端就停推分数，
+    // 这条分支会在「PK 结束 (60s)」刚出现 1 秒时把人清光
+    //（2026-09-14 实测：PK 条消失、主播位置变化）。窗口以 phase 为准
+    if (scoreUids.isEmpty && syncOrder.length >= 2 && _nTotals.isNotEmpty) {
+      if (_nPhase != 2) {
+        _clearParticipants();
+        return;
+      }
     }
-    // 首个同步消息的名单可能只含部分人（先到者被顶到队头，导致徽章整体
+    // 分数流标记：本次同步带了 user_scores = 战局进行中（进行中进房收不到
+    // BattleStatus，靠它识别"有 PK"，PK 条立即显示而不必手动刷新）
+    if (scoreUids.isNotEmpty) _nSawScores = true;
+    // 反过来：明确收到"只有连麦名单、无任何分数"且也没有战斗计时/战斗号，
+    // 说明战局已结束（退回纯连麦），清掉分数流标记，PK 条随之消失
+    if (scoreUids.isEmpty &&
+        syncOrder.length >= 2 &&
+        (_nBattleIdStr == null || _nBattleIdStr!.isEmpty) &&
+        _nDurSec == 0) {
+      _nSawScores = false;
+    }
+    // 同步消息可能只携带部分人（WS 数组打散/分片推送，2026-09-14 实测
+    // 4 人局一度只剩 2 个徽章），不能按"单条未包含"剔除；30 秒内从未
+    // 出现在任何同步里的 uid 才视为已退出（退出后不再出现在后续同步里）。
+    // 惩罚窗口内不剔除：此时服务端不再推分数，全员集体"超 30s 没出现"，
+    // 会在 60s 读秒中途把人清空（2026-09-14 实测 60s 窗口被砍掉）
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final punishFrom = _nStartMs + _nDurSec * 1000;
+    final inPunish = _nStartMs > 0 && _nDurSec > 0 && nowMs >= punishFrom;
+    for (final u in scoreUids) {
+      _nLastSeen[u] = nowMs;
+      // 不进 _nOrder：WS 数组每条消息顺序随机打散，进去会污染格子序，
+      // 成员齐不齐由 _rebuildNew 的合并序兜底
+    }
+    // 30s 没出现的人只在"部分人超时、其他人还在"时清（真退人）。
+    // 全员超时 = 没人上分（进行中）或服务端停推（惩罚窗口），不清
+    //（用户口径 2026-09-14：PK 中没上分也要一直显示，含 60s 惩罚）
+    if (!inPunish && _nTotals.length >= 2) {
+      final quitOut = _nTotals.keys
+          .where((u) => nowMs - (_nLastSeen[u] ?? nowMs) > 30000)
+          .toList();
+      if (quitOut.isNotEmpty && quitOut.length < _nTotals.length) {
+        for (final u in quitOut) {
+          _nTotals.remove(u);
+          _nRank.remove(u);
+          _nTeamScore.remove(u);
+          _nAnchorTeam.remove(u);
+          _nNames.remove(u);
+          _nOrder.remove(u);
+          _nLastSeen.remove(u);
+        }
+      }
+    }    // 首个同步消息的名单可能只含部分人（先到者被顶到队头，导致徽章整体
     // 错位一格），因此名单不短于已跟踪人数时整体重排；个别缺的人补在尾部
     if (syncOrder.length >= 2 && syncOrder.length >= _nOrder.length) {
       final known = Set<int>.of(_nOrder);
@@ -1145,7 +1249,11 @@ class DouyinPkTracker {
   }
 
   /// WebcastLinkmicUIMessage：网格位置与昵称
+  /// proto LinkmicUIBasic.positions = 5（LinkmicPosition{position=1, user=3}）
+  /// user.user_id 是 string；部分房间 varint。无论 uid 是否已在
+  /// _nOrder 都写入 _uiSeat——PK 房 scores 先到时旧逻辑会把座位丢掉。
   void onLinkmicUI(List<int> payload) {
+    var changed = false;
     final r = PbReader(payload);
     r.forEachField((f, w) {
       if (f == 3 && w == 2) {
@@ -1154,7 +1262,7 @@ class DouyinPkTracker {
           if (bf == 5 && bw == 2) {
             final pos = PbReader(basic.readBytes());
             int? position;
-            String? uidStr;
+            int uid = 0;
             String? nick;
             pos.forEachField((pf, pw) {
               if (pf == 1 && pw == 0) {
@@ -1165,7 +1273,11 @@ class DouyinPkTracker {
                 final user = PbReader(pos.readBytes());
                 user.forEachField((uf, uw) {
                   if (uf == 1 && uw == 2) {
-                    uidStr = user.readString();
+                    uid = int.tryParse(user.readString()) ?? 0;
+                    return true;
+                  }
+                  if (uf == 1 && uw == 0) {
+                    uid = user.readVarint();
                     return true;
                   }
                   if (uf == 2 && uw == 2) {
@@ -1178,15 +1290,15 @@ class DouyinPkTracker {
               }
               return false;
             });
-            final uid = int.tryParse(uidStr ?? '') ?? 0;
             if (uid != 0) {
-              _nNames[uid] = (nick?.isNotEmpty ?? false) ? nick! : '主播$uid';
-              if (!_nOrder.contains(uid)) {
-                if (position == null) {
-                  _nOrder.add(uid);
-                } else {
-                  final idx = position!.clamp(0, _nOrder.length);
-                  _nOrder.insert(idx, uid);
+              if (nick != null && nick!.isNotEmpty) _nNames[uid] = nick!;
+              if (!_nOrder.contains(uid)) _nOrder.add(uid);
+              if (position != null) {
+                // position=0 时 protobuf 省略字段，上面读到 null；
+                // 有人的空座位不写入。0 号格若真出现会带 field 1=0。
+                if (_uiSeat[position] != uid) {
+                  _uiSeat[position!] = uid;
+                  changed = true;
                 }
               }
             }
@@ -1198,13 +1310,153 @@ class DouyinPkTracker {
       }
       return false;
     });
-    _rebuildNew();
+    if (changed || _uiSeat.isNotEmpty) _rebuildNew();
   }
 
   /// WebcastBattleEndPunishMessage：PK 结束（惩罚阶段）
   void onBattleEndPunish(List<int> payload) {
     _nPhase = 2;
     _rebuildNew();
+  }
+
+  /// WebcastLinkMessage：纯连麦（非 PK）名单事件 + 连麦退出事件。
+  /// 布局 2026-09-14 dump 实测：f13 = repeated { f1 = repeated user
+  /// {1=uid, 2=room_id, 3=昵称, 4=连麦状态} }，f1 出现顺序即格子顺序。
+  /// 战局中（已有分数流）不采纳新名单，但 PK 进入惩罚/结束后仍把
+  /// 这条消息视为"可能退出连线"信号——2026-09-15 柱子🤍vs 扶摇 1v1 实测：
+  /// PK 惩罚阶段对方退出连线，仅靠 SEATMAP 30s 后空表清，名字徽章
+  /// 持续挂着近一分钟。found 为空或不含现存 uid 即视为退出 → 立刻清
+  void onLinkMessage(List<int> payload) {
+    final found = <int, String>{};
+    final r = PbReader(payload);
+    r.forEachField((f, w) {
+      if (f == 13 && w == 2) {
+        final grp = PbReader(r.readBytes());
+        grp.forEachField((gf, gw) {
+          if (gf == 1 && gw == 2) {
+            final u = PbReader(grp.readBytes());
+            int? uid;
+            String? nick;
+            u.forEachField((uf, uw) {
+              if (uf == 1 && uw == 0) {
+                uid = u.readVarint();
+                return true;
+              }
+              if (uf == 3 && uw == 2) {
+                nick = u.readString();
+                return true;
+              }
+              return false;
+            });
+            if (uid != null && uid != 0) found[uid!] = nick ?? '';
+            return true;
+          }
+          return false;
+        });
+        return true;
+      }
+      return false;
+    });
+    if (found.isEmpty) return _onLinkMessageHeuristic(payload);
+    _applyLinkUsers(found);
+  }
+
+  /// 字段布局未覆盖时的兜底：按"子消息内同时含 uid + 昵称"启发式扫描，
+  /// 只有找到 ≥2 个"带昵称的 uid"才采纳（防其它子消息里的数字字段误判）
+  void _onLinkMessageHeuristic(List<int> payload) {
+    final cands = <List<int>>[];
+    void collect(List<int> bytes, int depth) {
+      if (depth > 2 || cands.length > 64) return;
+      final r = PbReader(bytes);
+      r.forEachField((f, w) {
+        if (w == 2) {
+          final b = r.readBytes();
+          cands.add(b);
+          collect(b, depth + 1);
+          return true;
+        }
+        return false;
+      });
+    }
+
+    collect(payload, 0);
+    final found = <int, String>{};
+    for (final b in cands) {
+      final r = PbReader(b);
+      int? uid;
+      String? nick;
+      r.forEachField((f, w) {
+        if (w == 0) {
+          final v = r.readVarint();
+          if (f == 1 && v > 1000) uid = v;
+          return true;
+        }
+        if (w == 2) {
+          final s = utf8.decode(r.readBytes(), allowMalformed: true).trim();
+          if (s.isEmpty) return true;
+          if (RegExp(r'^\d{6,}$').hasMatch(s)) {
+            uid ??= int.tryParse(s);
+          } else if (nick == null &&
+              s.length <= 30 &&
+              !s.contains('/') &&
+              RegExp(r'[一-龥A-Za-z]').hasMatch(s)) {
+            nick = s;
+          }
+          return true;
+        }
+        return false;
+      });
+      if (uid != null && nick != null && nick!.isNotEmpty) {
+        found[uid!] = nick!;
+      }
+    }
+    if (found.length < 2) return;
+    _applyLinkUsers(found);
+  }
+
+  /// 名单入库：真名覆盖"主播N"占位，新 uid 按出现序追加到顺序表尾。
+  /// 当 PK 战局已进入惩罚/结束阶段且本次消息没带来任何当前参与者
+  /// （found 不含 _nTotals 任一 uid），视为"连线退出" → 立刻清空
+  /// 参与者并发空状态。2026-09-15 1v1 实测：SEATMAP 30s 后才空，
+  /// 期间徽章一直挂着
+  void _applyLinkUsers(Map<int, String> found) {
+    if (found.isEmpty) {
+      _maybeClearOnLinkExit();
+      return;
+    }
+    // 战局结束阶段：found 不包含现存参与者 → 退出
+    if (_nTotals.isNotEmpty) {
+      final known = found.keys.toSet();
+      final overlap = known.any(_nTotals.containsKey);
+      if (!overlap) {
+        _maybeClearOnLinkExit();
+        return;
+      }
+    }
+    var changed = false;
+    for (final e in found.entries) {
+      if (!_nNames.containsKey(e.key) ||
+          _nNames[e.key]!.startsWith('主播')) {
+        _nNames[e.key] = e.value;
+        changed = true;
+      }
+      if (!_nOrder.contains(e.key)) {
+        _nOrder.add(e.key);
+        changed = true;
+      }
+    }
+    if (changed) _rebuildNew();
+  }
+
+  /// PK 战局已结束（惩罚中或战局已结束）且连线已退出：
+  /// 清空参与者并 emit 空状态让 UI 立刻隐藏徽章/条。
+  /// 进入判定的条件：战局已 BattleEnd（服务端发了 endpunish）+ 后续
+  /// LinkMessage 不再带回任何参与者 = 全员退出连线。仅惩罚中（_nPhase==2）
+  /// 或 _battleFinished=true 时清，进行中 PK 不动
+  void _maybeClearOnLinkExit() {
+    if (_nTotals.isEmpty) return;
+    if (_nPhase != 2 && !_battleFinished()) return;
+    _clearParticipants();
   }
 
   /// WebcastLinkmicEnlargeGuestMessage：主持人放大/恢复某主播画面。
@@ -1242,17 +1494,93 @@ class DouyinPkTracker {
     _rebuildNew();
   }
 
+  /// 战局是否已结束：BattleStatus phase>=3，或"进行中时长+惩罚时长"已过
+  /// （惩罚时长未知时兜底 60 秒）。PK/连线退出后服务端仍会推送带旧分数的
+  /// 同步消息，靠它在跟踪器侧拦截，徽章不再挂屏（2026-09-14 实测）
+  bool _battleFinished() {
+    if (_nPhase >= 3) return true;
+    if (_nPhase == 2) return false; // Punish 阶段不视为结束
+    if (_nStartMs <= 0 || _nDurSec <= 0) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final grace = _nPunishSec > 0 ? _nPunishSec * 1000 : 60000;
+    return now >= _nStartMs + _nDurSec * 1000 + grace;
+  }
+
+  /// 清空战局参与者并立即发出空状态（徽章/条随之消失）。
+  /// 保留真实昵称（连麦名单 WebcastLinkMessage 还要用）；
+  /// 保留战斗号/计时/阶段——结束后同步仍推旧分数，_battleFinished
+  /// 继续拦截，直到新一局 BattleStatus 重置计时才放行
+  void _clearParticipants() {
+    _nTotals.clear();
+    _nRank.clear();
+    _nTeamScore.clear();
+    _nAnchorTeam.clear();
+    _nNames.removeWhere((u, n) => n.startsWith('主播'));
+    _nOrder.clear();
+    _nLastSeen.clear();
+    _nSawScores = false;
+    _state = LivePkState(lastUpdateMs: DateTime.now().millisecondsSinceEpoch);
+    _emit();
+  }
+
   void _rebuildNew() {
+    // 战局已结束：清掉残留参与者并发出空状态（此前徽章会一直挂着）
+    if (_nTotals.isNotEmpty && _battleFinished()) {
+      _clearParticipants();
+      return;
+    }
     // 顺序优先级：座位表（linker_map，权威）> linked_users > 出现序。
     // 出现序 = 本房优先 + 其余按首次入列序（≈加入战斗频道顺序）：
     // 2026-09-13 你好阿童房 3人/4人两轮实测，真格序都是
     // [本房, 小豆包, 妮可, 简丹]——发起方在首格、挑战者按加入顺序入格；
     // uid 排序与此无关（只碰对过 1-3 格）
-    final ids = _seatOrder.isNotEmpty
-        ? [for (final p in _seatOrder.keys.toList()..sort()) _seatOrder[p]!]
-        : _nOrder.isNotEmpty
-            ? _nOrder
-            : _orderedIds();
+    // 顺序优先级：座位表 > linked_users 名单(_nOrder) > 名次序。
+    // 名单之外的成员按名次序补尾：拉人后数量立即跟上，同时不被
+    // WS 数组每到一条就随机打散的"出现序"污染（2026-09-14 实测
+    // 1v1 本房因旧逻辑的 scoreUids 补序被挤到右侧）
+    // 顺序：linker_map 座位 > UI positions 座位 > 本房优先+_nOrder。
+    // 有座位时不要把本房提到 idx0——座位号才是格子。
+    // 无座位时本房排 idx0（2026-09-14 乱斗实测）。
+    final bool seated;
+    final List<int> ids;
+    if (_seatOrder.isNotEmpty) {
+      seated = true;
+      final seatIds = [
+        for (final p in _seatOrder.keys.toList()..sort()) _seatOrder[p]!,
+      ];
+      ids = [...seatIds, for (final u in _nOrder) if (!seatIds.contains(u)) u];
+    } else if (_uiSeat.isNotEmpty) {
+      seated = true;
+      final seatIds = [
+        for (final p in _uiSeat.keys.toList()..sort()) _uiSeat[p]!,
+      ];
+      ids = [...seatIds, for (final u in _nOrder) if (!seatIds.contains(u)) u];
+    } else if (_nOrder.isNotEmpty && _nLocalId != 0 &&
+        _nOrder.contains(_nLocalId)) {
+      seated = false;
+      if (_nHasTeamScores || _nOrder.length != 8) {
+        // 组队、以及 4/6 人乱斗：本房提到队头，其余保持加入序相对序。
+        // 2026-09-14 4 人乱斗实测 3↔4：本房提前+行优先才对；
+        // 若按 8 人那样旋转，本房前的人会被甩到队尾，右上/左下全错。
+        ids = [
+          _nLocalId,
+          for (final u in _nOrder)
+            if (u != _nLocalId) u,
+        ];
+      } else {
+        // 8 人乱斗：从本房在加入序中的位置转一圈（本房之前的人接到末尾）。
+        // 2026-09-14 8 人乱斗实测：本房提前会把本房前的人留在第二格，
+        // 官方是本房当起点、前面的人排到队尾；再按行优先铺 4x2。
+        final i = _nOrder.indexOf(_nLocalId);
+        ids = [
+          ..._nOrder.sublist(i),
+          ..._nOrder.sublist(0, i),
+        ];
+      }
+    } else {
+      seated = false;
+      ids = List<int>.of(_nOrder);
+    }
     final parts = <LivePkSide>[];
     for (final id in ids) {
       parts.add(LivePkSide(
@@ -1264,7 +1592,14 @@ class DouyinPkTracker {
         teamScore: _nTeamScore[id] ?? 0,
       ));
     }
-    if (parts.isEmpty) return;
+    if (parts.isEmpty) {
+      // 已无任何参与者：发出空状态让 UI 隐藏徽章/条。
+      // 否则退出连线或 PK 整体结束后，名字徽章会一直挂着——
+      // 2026-09-15 实测（柱子🤍vs 扶摇 1v1 退出连线）：parts 为空时
+      // 直接 return，UI 拿不到清屏信号
+      _clearParticipants();
+      return;
+    }
 
     // 1v1 注意：不做"本房强制在左"的交换——合成画面的左右以
     // linker_map 座位表为准（随刷新更新，抖音换位我们跟随）；
@@ -1292,6 +1627,12 @@ class DouyinPkTracker {
 
     var phase = LivePkPhase.running;
     if (_nPhase == 2) phase = LivePkPhase.punish;
+    // Punish 阶段即使 durationMs=0 也视为"战斗进行中"，
+    // 让 PK 条和分值完整保留到 60s 读完
+    if (phase == LivePkPhase.punish && _nDurSec == 0) {
+      _nDurSec = 60; // 兜底 60s
+      _nStartMs = DateTime.now().millisecondsSinceEpoch - 60000;
+    }
 
     // 大格模板只在确认放大后启用（enlarge 标记/消息）；未放大的
     // 9 人局是 3x3 均匀构图（2026-09-13 实测），不能默认套大格模板
@@ -1311,6 +1652,9 @@ class DouyinPkTracker {
       enlargedUserId: _nEnlargedUid,
       bigMode: _nPipMode,
       pipMode: _nPipMode && parts.length == 2,
+      lastUpdateMs: DateTime.now().millisecondsSinceEpoch,
+      hasScoreFlow: _nSawScores,
+      hasSeatOrder: seated,
     );
     _emit();
   }

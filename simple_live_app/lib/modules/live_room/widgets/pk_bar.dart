@@ -18,7 +18,8 @@ import 'package:simple_live_core/src/danmaku/douyin_pk.dart';
 // 位置换算：播放器默认 BoxFit.contain 会留黑边，必须按视频实际显示矩形定位。
 // 多人(count>2)合成画面（竖屏 1080x1920）格子带 = 视频高度 18.75%~68.75%
 // （模板：顶部背景带 360 + 格子区 960 + 底部 600，三张截图实测一致）。
-// 格子布局自适应（_layoutCells）：4人=2x2；3人/主持人放大=左大格+右列堆叠。
+// 格子布局自适应（_layoutCells）：4人=2x2；5人=上2下3（桁菜房实测）；
+// 3人/主持人放大=左大格+右列堆叠。
 // 徽章=每格左下（名次+分数，0 分不显名次）、名字=每格右下。
 // 组队赛条=teamBar()：左=本房主播所在队（field 18 标记）。
 // ============================================================================
@@ -77,13 +78,19 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
     super.dispose();
   }
 
-  /// BoxFit.contain 下视频在控件内的实际显示矩形
+  /// BoxFit.contain 下视频在控件内的实际显示矩形。
+  /// 分辨率未知（视频未加载/流未出画面）时按整个窗口处理：
+  /// 标题/角标贴窗口顶部，避免按猜测宽高比定位后悬在半空
+  ///（2026-09-13 实测：横屏直播在竖屏窗口加载中，兜底 9:16 让标题悬空）
   Rect _videoRect(Size box) {
     final ar = widget.videoAspectRatioProvider?.call();
     final mode = widget.scaleModeProvider?.call() ?? 0;
     if (ar == null || ar <= 0 || mode == 1 || mode == 2) {
       return Offset.zero & box;
     }
+    // 区分"播放器真的还没出画面"（宽高为 0）与真实宽高比：
+    // provider 在宽高为 0 时会返回兜底猜测值，这里无法区分，
+    // 因此由 provider 保证未知时返回 null（见 live_room_page 接线）
     final boxAr = box.width / box.height;
     if (ar > boxAr) {
       final h = box.width / ar;
@@ -108,15 +115,22 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
       }
       // 惩罚倒计时走完 → PK 彻底结束，PK 元素全部消失（此前停在"PK结束(0s)"）。
       // 进行中但时间走完且无惩罚信号（如对方提前退出连线）→ 同样视为结束
+      final nowMs = widget.nowMs();
+      // PK 生命周期 = 进行中时长 + 「PK 结束」60s 惩罚倒计时，全部走完
+      // 条和分值才消失（用户口径 2026-09-14）。惩罚时长未知按 60s
+      //（抖音常态），到位后由服务端真实值覆盖
+      final punishDurMs =
+          s != null && s.punishDurationMs > 0 ? s.punishDurationMs : 60000;
+      final battleEndAtMs = s != null && s.startTimeMs > 0 && s.durationMs > 0
+          ? s.startTimeMs + s.durationMs
+          : 0;
+      // 15 秒无消息兜底只针对"对方真退了"（count<=1）。
+      // 进行中没人上分、以及「PK 结束 60s」窗口内服务端停推分数，
+      // 都不能因超时把条/分值搞没（用户口径 2026-09-14）
+      final stale = s != null && s.count <= 1;
       final pkOver = s != null &&
-          ((s.phase == LivePkPhase.punish &&
-                  s.punishDurationMs > 0 &&
-                  s.punishStartMs > 0 &&
-                  widget.nowMs() >= s.punishStartMs + s.punishDurationMs) ||
-              (s.phase == LivePkPhase.running &&
-                  s.startTimeMs > 0 &&
-                  s.durationMs > 0 &&
-                  widget.nowMs() >= s.startTimeMs + s.durationMs));
+          ((battleEndAtMs > 0 && nowMs >= battleEndAtMs + punishDurMs) ||
+              stale);
       if (s == null || s.count == 0) {
         // 无 PK 数据：只剩标题与人数角标
         if (viewers <= 0 && widget.title.isEmpty) {
@@ -124,19 +138,19 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
         }
         return LayoutBuilder(
           builder: (context, c) {
-            final rect = _videoRect(Size(c.maxWidth, c.maxHeight));
-            final scale = (rect.width / 900).clamp(1.0, 2.2);
+            final scale =
+                (c.maxWidth / 900).clamp(1.0, 2.2);
             return Stack(
               children: [
                 if (widget.title.isNotEmpty)
                   Positioned(
-                    top: rect.top + 8 * scale,
-                    left: rect.left,
-                    width: rect.width,
+                    top: 8 * scale,
+                    left: 0,
+                    width: c.maxWidth,
                     child: Center(
                       child: ConstrainedBox(
                         constraints:
-                            BoxConstraints(maxWidth: rect.width * 0.52),
+                            BoxConstraints(maxWidth: c.maxWidth * 0.52),
                         child: Container(
                           padding: EdgeInsets.symmetric(
                               horizontal: 10 * scale, vertical: 3 * scale),
@@ -159,16 +173,17 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                   ),
                 if (viewers > 0)
                   Positioned(
-                    // 标题下方一行：长标题时人数角标纵向堆叠避让
-                    top: rect.top +
-                        8 * scale +
-                        (widget.title.isNotEmpty ? 30 * scale : 0),
-                    left: rect.left,
-                    width: rect.width,
+                    // 与标题同一行，右上角对齐
+                    top: 8 * scale,
+                    left: 0,
+                    width: c.maxWidth,
                     child: Align(
                       alignment: Alignment.topRight,
-                      child: DouyinViewerCountBadge(
-                          count: viewers, scale: scale),
+                      child: Padding(
+                        padding: EdgeInsets.only(right: 12 * scale),
+                        child: DouyinViewerCountBadge(
+                            count: viewers, scale: scale),
+                      ),
                     ),
                   ),
               ],
@@ -181,29 +196,32 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
         builder: (context, c) {
           final rect = _videoRect(Size(c.maxWidth, c.maxHeight));
           // PK 元素结束（pkOver）后条/倒计时消失，徽章（名字+分值）保留
-          final hasBattle = s.durationMs > 0 && !pkOver;
+          // 进行中进房收不到 BattleStatus（durationMs=0），此时靠分数流
+          // （hasScoreFlow）判断战局存在，否则 PK 条要手动刷新才出现
+          final hasBattle = s.count >= 2 &&
+              (s.durationMs > 0 || s.hasScoreFlow) &&
+              !pkOver;
           final scale = (rect.width / 900).clamp(1.0, 2.2);
-          // 标题固定在视频顶部；PK 条下移避让标题（用户要求，勿改反）
+          // 标题/条/角标贴窗口顶部（黑边上，用户口径 2026-09-13）：
+          // 不随视频黑边移动，视频内不出现标题。徽章仍贴视频格子。
           final hasTitle = widget.title.isNotEmpty;
           final barTop = rect.top + 8 * scale + (hasTitle ? 30 * scale : 0);
-          // 人数角标纵向堆叠避让：标题行 → PK 条行 → 角标行，永不重叠
-          final badgeTop = rect.top +
-              8 * scale +
-              (hasTitle ? 30 * scale : 0) +
-              (hasBattle ? 52 * scale : 0);
+          // 人数角标与标题同一行（用户口径 2026-09-13：右上角对齐标题），
+          // PK 条/倒计时在下一行不与角标重叠
+          final badgeTop = rect.top + 8 * scale;
 
           return Stack(
             children: [
               // 顶部居中：直播间标题（仿网页版黑底白字胶囊，位置固定）
               if (hasTitle)
                 Positioned(
-                  top: rect.top + 8 * scale,
-                  left: rect.left,
-                  width: rect.width,
+                  top: 8 * scale,
+                  left: 0,
+                  width: c.maxWidth,
                   child: Center(
                     child: ConstrainedBox(
                       constraints:
-                          BoxConstraints(maxWidth: rect.width * 0.52),
+                          BoxConstraints(maxWidth: c.maxWidth * 0.52),
                       child: Container(
                         padding: EdgeInsets.symmetric(
                             horizontal: 10 * scale, vertical: 3 * scale),
@@ -224,10 +242,13 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                     ),
                   ),
                 ),
-              // 顶部双方进度条（组队赛 / 1v1）
+              /// 顶部双方进度条（组队赛 / 1v1）
+              // 条压真实画面顶边：视频区可能在窗口内嵌着（BoxFit.contain
+              // 留黑边），用 _videoRect 算出的 rect.top 就是真实画面顶。
+              // 用户口径 2026-09-14：条下移 50 像素看效果
               if (hasBattle && (s.teamBattle || s.count == 2))
                 Positioned(
-                  top: barTop,
+                  top: rect.top + 50 * scale,
                   left: rect.left,
                   width: rect.width,
                   child: Center(
@@ -238,7 +259,7 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
               // 个人赛：紧凑倒计时（仿抖音「PK 06:51」样式）
               if (hasBattle && !(s.teamBattle || s.count == 2))
                 Positioned(
-                  top: barTop,
+                  top: rect.top + 50 * scale,
                   left: rect.left,
                   width: rect.width,
                   child: Center(
@@ -247,23 +268,29 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                   ),
                 ),
               // 格子徽章（count>=2）：叠加在合成画面的格子上。
-              // 实测（2026-09-12 多张截图交叉验证）：竖屏合成流(1080x1920)
-              // 多人格子带 = 视频高度 18.75%~68.75%（模板 360+960+600）；
-              // 1v1 = 两个格子并排占上部约 45%。布局自适应见 _layoutCells。
-              // PK 期间显示 名次+分数（本房队粉/对方队蓝）；非 PK 连麦时
-              // 有礼物值也显示（同网页版）；1v1 只显名字（分数在条上）。
-              if (s.count >= 2)
+              // 状态超时 15 秒无更新（对方中途退出连线）时隐去，防徽章挂屏
+              if (s.count >= 2 && !stale)
                 Positioned(
                   left: rect.left,
                   top: rect.top +
-                      rect.height * (s.count == 2 ? 0 : 0.1875),
+                      rect.height *
+                          (s.count == 2
+                              ? 0
+                              : (s.bigMode ? 0 : 0.1875)),
                   width: rect.width,
-                  height: rect.height * (s.count == 2 ? 0.60 : 0.50),
+                  height: rect.height *
+                      (s.count == 2
+                          ? 0.60
+                          : (s.bigMode ? 1.0 : 0.50)),
                   child: DouyinPkGridOverlay(
                     state: s,
                     width: rect.width,
-                    height: rect.height * (s.count == 2 ? 0.60 : 0.50),
+                    height: rect.height *
+                        (s.count == 2
+                            ? 0.60
+                            : (s.bigMode ? 1.0 : 0.50)),
                     hasBattle: hasBattle,
+                    pkOver: pkOver,
                     scale: scale,
                     localNickname: widget.localNickname,
                   ),
@@ -272,12 +299,15 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
               if (viewers > 0)
                 Positioned(
                   top: badgeTop,
-                  left: rect.left,
-                  width: rect.width,
+                  left: 0,
+                  width: c.maxWidth,
                   child: Align(
                     alignment: Alignment.topRight,
-                    child: DouyinViewerCountBadge(
-                        count: viewers, scale: scale),
+                    child: Padding(
+                      padding: EdgeInsets.only(right: 12 * scale),
+                      child: DouyinViewerCountBadge(
+                          count: viewers, scale: scale),
+                    ),
                   ),
                 ),
             ],
@@ -328,7 +358,9 @@ class DouyinPkBar extends StatelessWidget {
     final ratio = isTeam
         ? bars[2]
         : (ls + rs > 0 ? ls / (ls + rs) : 0.5);
-    final leftFlex = (ratio * 100).round().clamp(2, 98);
+    // 双方至少各占 15% 宽（数字能完整显示，用户口径 2026-09-14）
+    // 原 clamp(2,98) 太窄，差距大时弱势方条几乎消失
+    final leftFlex = (ratio * 100).round().clamp(15, 85);
     final rightFlex = 100 - leftFlex;
 
     final leftScore = isTeam ? bars[0].round() : ls;
@@ -337,97 +369,129 @@ class DouyinPkBar extends StatelessWidget {
     final remain = state.remainingMs(nowMs());
     final mm = (remain ~/ 60000).toString().padLeft(2, '0');
     final ss = ((remain % 60000) ~/ 1000).toString().padLeft(2, '0');
-    final label = state.phase == LivePkPhase.punish
+    // 惩罚阶段以时间判断（phase 字段可能晚到/缺失）：进行中时间走完
+    // 即进入「PK 结束」60s 读秒（用户口径 2026-09-14）
+    final endAt = state.startTimeMs + state.durationMs;
+    final inPunish =
+        state.durationMs > 0 && state.startTimeMs > 0 && nowMs() >= endAt;
+    final label = inPunish
         ? _punishLabel(state, nowMs())
         : (state.durationMs > 0 ? '$mm:$ss' : 'PK');
 
-    return Container(
-      padding: EdgeInsets.symmetric(horizontal: 12 * ds, vertical: 6 * ds),
-      decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.45),
-        borderRadius: BorderRadius.circular(12 * ds),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
+    return LayoutBuilder(
+      // 条宽 = 整窗宽 100%（用户口径 2026-09-14）
+      builder: (context, c) {
+        return SizedBox(
+      // 仿官方 PK 条：近全宽渐变胶囊（左粉右蓝），两端大分值，
+      // 底部中央叠「PK mm:ss」小黑胶囊（2026-09-14 用户供图）
+      width: c.maxWidth,
+      height: 34 * ds,
+      child: Stack(
+        alignment: Alignment.bottomCenter,
         children: [
-          Text(
-            label,
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 12 * ds,
-              fontWeight: FontWeight.w500,
+          Positioned(
+            left: 0,
+            right: 0,
+            top: 0,
+            height: 22 * ds,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(11 * ds),
+              child: Row(
+                children: [
+                  Expanded(
+                    flex: leftFlex,
+                    child: Container(
+                      decoration: const BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.centerLeft,
+                          end: Alignment.centerRight,
+                          colors: [Color(0xFFFE2C55), Color(0xFFFF7EA6)],
+                        ),
+                      ),
+                      alignment: Alignment.centerLeft,
+                      padding: EdgeInsets.only(left: 10 * ds),
+                      child: Text(
+                        '$leftScore',
+                        style: TextStyle(
+                          color: const Color(0xFF8A1030),
+                          fontSize: 15 * ds,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    flex: rightFlex,
+                    child: Container(
+                      decoration: const BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.centerLeft,
+                          end: Alignment.centerRight,
+                          colors: [Color(0xFF9FD8F5), Color(0xFF0FA9E6)],
+                        ),
+                      ),
+                      alignment: Alignment.centerRight,
+                      padding: EdgeInsets.only(right: 10 * ds),
+                      child: Text(
+                        '$rightScore',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 15 * ds,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
-          SizedBox(height: 5 * ds),
-          Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // 分数可达 7~9 位（队伍总分），FittedBox 防折行/溢出
-              SizedBox(
-                width: 76 * ds,
-                height: 20 * ds,
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: Text(
-                    '$leftScore',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 14 * ds,
-                      fontWeight: FontWeight.w500,
-                    ),
+          // 中央「PK mm:ss」小黑胶囊，压在条的底边中点上
+          Container(
+            padding:
+                EdgeInsets.symmetric(horizontal: 10 * ds, vertical: 1 * ds),
+            decoration: BoxDecoration(
+              color: const Color(0xE6101120),
+              borderRadius: BorderRadius.circular(9 * ds),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'PK',
+                  style: TextStyle(
+                    color: const Color(0xFFFE2C55),
+                    fontSize: 11 * ds,
+                    fontWeight: FontWeight.w900,
+                    fontStyle: FontStyle.italic,
                   ),
                 ),
-              ),
-              SizedBox(width: 8 * ds),
-              SizedBox(
-                width: 180 * ds,
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(4 * ds),
-                  child: SizedBox(
-                    height: 8 * ds,
-                    child: Row(
-                      children: [
-                        Expanded(
-                          flex: leftFlex,
-                          child: Container(color: const Color(0xFFE24B8A)),
-                        ),
-                        Expanded(
-                          flex: rightFlex,
-                          child: Container(color: const Color(0xFF378ADD)),
-                        ),
-                      ],
-                    ),
+                SizedBox(width: 4 * ds),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 11 * ds,
+                    fontWeight: FontWeight.w700,
                   ),
                 ),
-              ),
-              SizedBox(width: 8 * ds),
-              SizedBox(
-                width: 76 * ds,
-                height: 20 * ds,
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: Text(
-                    '$rightScore',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 14 * ds,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
-              ),
-            ],
+              ],
+            ),
           ),
         ],
-      ),
+        ),
+        );
+      },
     );
   }
 
   /// 惩罚阶段剩余秒数 → 「PK结束 (Ns)」
+  /// 惩罚时长未知按 60s（服务端给了用真实值，未给先兜底，到位后覆盖）
   static String _punishLabel(LivePkState s, int now) {
-    final end = s.punishStartMs + s.punishDurationMs;
-    if (s.punishDurationMs <= 0) return 'PK结束';
-    final left = ((end - now) / 1000).ceil().clamp(0, 9999);
+    final start =
+        s.punishStartMs > 0 ? s.punishStartMs : s.startTimeMs + s.durationMs;
+    final dur = s.punishDurationMs > 0 ? s.punishDurationMs : 60000;
+    final left = ((start + dur - now) / 1000).ceil().clamp(0, 9999);
     return 'PK结束 (${left}s)';
   }
 }
@@ -452,7 +516,11 @@ class DouyinPkCountdownChip extends StatelessWidget {
     final remain = state.remainingMs(nowMs());
     final mm = (remain ~/ 60000).toString().padLeft(2, '0');
     final ss = ((remain % 60000) ~/ 1000).toString().padLeft(2, '0');
-    final label = state.phase == LivePkPhase.punish
+    // 惩罚阶段以时间判断（phase 字段可能晚到/缺失）
+    final endAt = state.startTimeMs + state.durationMs;
+    final inPunish =
+        state.durationMs > 0 && state.startTimeMs > 0 && nowMs() >= endAt;
+    final label = inPunish
         ? DouyinPkBar._punishLabel(state, nowMs())
         : 'PK $mm:$ss';
 
@@ -493,7 +561,8 @@ class _PkCell {
 }
 
 /// 由参与人数推断网格列数（抖音连麦布局：4人=2x2、6人=3x2、
-/// 8人=4x2（2026-09-12 实测）、9人=3x3；7人按 4 列 4+3 推测）
+/// 8人=4x2（2026-09-12 实测）、9人=3x3；7人按 4 列 4+3 推测）。
+/// 5 人不用列数（走 2+3 马赛克，见 _fiveCells）。
 int _columnsFor(int n) {
   if (n <= 2) return 2;
   if (n <= 4) return 2;
@@ -502,14 +571,74 @@ int _columnsFor(int n) {
   return 3;
 }
 
+/// 5 人官方构图：上 2 下 3（2026-09-14 桁菜房实测）。
+/// 截图窗口 810x739 缝：上下约对半（y=371/739≈0.50），
+/// 上排中缝 x=395/810≈0.49，下排三分 x=261/529 ≈ 0.32/0.65。
+/// 取整成 0.5 / 1/3，与画面差 <2%，徽章贴格底不受影响。
+/// 座位序已是格子序时，按人数套几何、人按 index 放，不再按队伍重排。
+/// 6 人列优先 3x2（左列 0/1、中列 2/3、右列 4/5）；4 人列优先 2x2；
+/// 5 人上2下3；其余用 _columnsFor 行优先（9 人 3x3 实测）。
+List<_PkCell> _cellsByIndex(List<LivePkSide> ordered) {
+  final n = ordered.length;
+  if (n == 5) return _fiveCells(ordered);
+  if (n == 6) {
+    const cols = 3;
+    const rows = 2;
+    return [
+      for (var i = 0; i < n; i++)
+        _PkCell(
+          ordered[i],
+          left: (i ~/ rows) / cols,
+          top: (i % rows) / rows,
+          width: 1 / cols,
+          height: 1 / rows,
+        ),
+    ];
+  }
+  final cols = _columnsFor(n);
+  final rows = (n / cols).ceil();
+  final columnMajor = n == 4 || n == 8;
+  return [
+    for (var i = 0; i < n; i++)
+      _PkCell(
+        ordered[i],
+        left: (columnMajor ? (i ~/ rows) : (i % cols)) / cols,
+        top: (columnMajor ? (i % rows) : (i ~/ cols)) / rows,
+        width: 1 / cols,
+        height: 1 / rows,
+      ),
+  ];
+}
+
+List<_PkCell> _fiveCells(List<LivePkSide> ordered) {
+  const specs = <List<double>>[
+    [0, 0, 0.5, 0.5], // 0 上左
+    [0.5, 0, 0.5, 0.5], // 1 上右
+    [0, 0.5, 1 / 3, 0.5], // 2 下左
+    [1 / 3, 0.5, 1 / 3, 0.5], // 3 下中
+    [2 / 3, 0.5, 1 / 3, 0.5], // 4 下右
+  ];
+  return [
+    for (var i = 0; i < ordered.length && i < 5; i++)
+      _PkCell(
+        ordered[i],
+        left: specs[i][0],
+        top: specs[i][1],
+        width: specs[i][2],
+        height: specs[i][3],
+      ),
+  ];
+}
+
 /// 合成画面布局（返回格子带比例坐标）：
 ///   2 人（1v1）      → 两格并排占上部 62%（用户微调：名字再往下一点）
 ///   4 人            → 2x2 均匀网格
 ///   3 人            → 左侧大格（本房主播，未知则第 1 名）+ 右列 2 格按名次
+///   5 人            → 上 2 下 3（2026-09-14 桁菜房实测，非 3x2）
 ///   9 人            → 默认 3x3 均匀网格（实测）；确认放大后才用
 ///                     左侧大格 + 右侧 3x3 八格
 ///   主持人放大       → 被放大者占左侧大格 + 其余右列堆叠
-///   其他（5-6 人等） → 均匀网格（列数按人数推断，未实测）
+///   其他（6 人等）   → 均匀网格（列数按人数推断）
 List<_PkCell> _layoutCells(LivePkState s) {
   final n = s.count;
   if (n == 2) {
@@ -531,6 +660,11 @@ List<_PkCell> _layoutCells(LivePkState s) {
       _PkCell(first, left: 0, top: 0, width: 0.5, height: 1),
       _PkCell(second, left: 0.5, top: 0, width: 0.5, height: 1),
     ];
+  }
+  // 官方座位序（LinkmicUI positions / linker_map）已排好 participants，
+  // 按 index 铺几何。组队 aCells 猜测三轮 6 人每次换的格子都不同，已证伪。
+  if (s.hasSeatOrder && n >= 3) {
+    return _cellsByIndex(s.participants);
   }
   int? bigUid = s.enlargedUserId != 0 ? s.enlargedUserId : null;
   // 大格模板只在"确认放大"后启用（EnlargeGuest 消息指定被放大者，
@@ -557,9 +691,9 @@ List<_PkCell> _layoutCells(LivePkState s) {
       _PkCell(big, left: 0, top: 0, width: 0.5, height: 1),
     ];
     final m = rest.length;
-    // 右侧小格列数：2-4 人单列（3 人局实测），5-6 人两列，7-9 人三列
-    //（9 人局实测右侧 3x3）
-    final rc = m <= 2 ? 1 : (m <= 6 ? 2 : 3);
+    // 右侧小格列数：2-4 人单列纵向堆叠（截图实测：4 人放大局右侧 3 人为
+    // 3x1 单列，之前逻辑 m=3 时 rc=2 导致错位）；5-6 人两列，7-9 人三列
+    final rc = m <= 4 ? 1 : (m <= 6 ? 2 : 3);
     final rr = (m / rc).ceil();
     for (var i = 0; i < m; i++) {
       cells.add(_PkCell(
@@ -578,17 +712,38 @@ List<_PkCell> _layoutCells(LivePkState s) {
   // 只有按队伍分块吻合）。4人(2v2) 按左列 [0,2]；1v3 人数不均时
   // 我队按序占前几格，对方队填满剩余（v32 4人局实测）。
   // 我队成员在格子内的先后 = 参与者顺序（本房优先+加入序）
-  if (s.teamBattle && (s.localTeamId ?? 0) != 0) {
-    final localTeam = s.localTeamId!;
-    final teamA = <LivePkSide>[];
-    final teamB = <LivePkSide>[];
-    for (final p in s.participants) {
-      if (p.teamId == localTeam) {
-        teamA.add(p);
-      } else {
-        teamB.add(p);
+  // 本房队伍未知时兜底用分数高的队伍当本房队（与 teamBar 一致，
+  // 避免 owner 详情缺失时跳过组队分支落到乱斗布局，2026-09-14 实测
+  // 4 人 2v2 局 localTeamId 未知 → 走到 4 人乱斗 → 蓝队位置反）
+  // 6 人组队：走下面组队分支的 aCells（2026-09-14 小好房 3v3 实测，
+  // 纯 participants 下标不打乱队伍，粉队整列+中上已有多轮不好使对）
+  if (s.teamBattle) {
+    final ts = s.teamScores;
+    int? localTeam = s.localTeamId;
+    // owner uid 已知时直接用其所在队伍（2026-09-14 实测 8 人局
+    // 粉队 332 vs 蓝队 17335，粉队是本房但分数低，按"分数高=本房队"
+    // 兜底会把本房队识别错）。owner 缺失才退到"分数高的队伍"
+    if ((localTeam ?? 0) == 0 && s.localUserId != 0) {
+      for (final p in s.participants) {
+        if (p.userId == s.localUserId && p.teamId != 0) {
+          localTeam = p.teamId;
+          break;
+        }
       }
     }
+    if ((localTeam ?? 0) == 0 && ts.isNotEmpty) {
+      localTeam = ts.keys.reduce((a, b) => (ts[b]! > ts[a]!) ? b : a);
+    }
+    if ((localTeam ?? 0) != 0) {
+      final teamA = <LivePkSide>[];
+      final teamB = <LivePkSide>[];
+      for (final p in s.participants) {
+        if (p.teamId == localTeam) {
+          teamA.add(p);
+        } else {
+          teamB.add(p);
+        }
+      }
     if (teamA.isNotEmpty && teamB.isNotEmpty) {
       final List<int> aCells;
       switch (n) {
@@ -596,24 +751,84 @@ List<_PkCell> _layoutCells(LivePkState s) {
           aCells = const [0];
           break;
         case 4:
-          aCells = const [0, 2];
+          // 2v2 我队占左列；3v1 时单人队固定右上（cell 1），
+          // 三人队占其余三格（2026-09-14 实测：单人队挂右下与官方不符）
+          aCells = switch ((teamA.length, teamB.length)) {
+            (1, 3) => const [0],
+            (3, 1) => const [0, 2, 3],
+            _ => const [0, 2],
+          };
+          break;
+        case 5:
+          // 上2下3：我队靠左。2v3 我队占上左+下左 [0,2]；
+          // 1v4 单人占上左 [0]；3v2 / 4v1 我队占左半再向下铺
+          // [0,2,3] / [0,2,3,4]（2026-09-14 桁菜房 2v3 实测）
+          aCells = switch ((teamA.length, teamB.length)) {
+            (1, 4) => const [0],
+            (2, 3) => const [0, 2],
+            (3, 2) => const [0, 2, 3],
+            (4, 1) => const [0, 2, 3, 4],
+            _ => const [0, 2],
+          };
           break;
         case 6:
-          aCells = const [0, 1, 3];
+          // 3x2 列优先（左列 0/1、中列 2/3、右列 4/5）。
+          // 2026-09-14 小好房 3v3：粉队 [左上,左下,中上]=[0,1,2]，简单按序；
+          // 早期桁菜房曾报 [0,2,1]，但那是把 participants 当格子序铺（
+          // 无队伍分块）时的错位，分组填格后 [0,1,2] 才对。
+          aCells = switch ((teamA.length, teamB.length)) {
+            (4, 2) => const [0, 1, 2, 3],
+            (2, 4) => const [0, 1],
+            _ => const [0, 1, 2],
+          };
           break;
         case 8:
-          // 4v4 未实测，按"我队占左半"推
-          aCells = const [0, 1, 4, 5];
+          // 4x2 列优先（左列 0/1、中左 2/3、中右 4/5、右列 6/7）。
+          // 2026-09-14 4v4 实测：粉队占左两列 [0,1,2,3]；旧值 [0,1,4,5]
+          // 配行优先会把粉队铺成上排左二+下排左二，用户报 2↔5。
+          aCells = switch ((teamA.length, teamB.length)) {
+            (3, 5) => const [0, 1, 2],
+            (5, 3) => const [0, 1, 2, 3, 4],
+            _ => const [0, 1, 2, 3], // 4v4
+          };
+          break;
+        case 9:
+          // 3x3 列优先（左列 0/1/2、中列 3/4/5、右列 6/7/8）。
+          // 2026-09-14 桁菜房 4v5 实测：粉队=左列+中上 [0,1,2,3]
+          // （桁菜/赵俊杰/光天翌/Li敖），蓝队占剩余。
+          aCells = switch ((teamA.length, teamB.length)) {
+            (5, 4) => const [0, 1, 2, 3, 4],
+            (3, 6) => const [0, 1, 2],
+            (6, 3) => const [0, 1, 2, 3, 4, 5],
+            _ => const [0, 1, 2, 3], // 4v5 默认
+          };
           break;
         default:
           aCells = [
             for (var i = 0; i < teamA.length && i < n; i++) i,
           ];
       }
-      final queue = <int>[
-        for (var i = 0; i < n; i++)
-          if (!aCells.contains(i)) i,
-      ];
+      // 对方队填剩余格的顺序：
+      //   4 人 2v2（行优先 2x2）：右列从下往上 [3,1]
+      //     2026-09-14 辰曦房实测蓝队 2↔4（右上↔右下）
+      //   6 人：从右列下往上绕 [5,4,3,…]（桁菜房第二轮 3↔6）
+      //   8 人 4v4 列优先：靠内列（cell 4/5=画面第3列）从下到上，
+      //     最右列（6/7）从上到下 → [5,4,6,7]
+      //     2026-09-14 实测 2↔5 后还要 3→7→4→3
+      //   其余：格子号升序
+      final queue = (n == 4 && teamA.length == 2 && teamB.length == 2)
+          ? const [3, 1]
+          : n == 6
+              ? [
+                  for (final i in const [5, 4, 3, 2, 1, 0])
+                    if (!aCells.contains(i)) i,
+                ]
+              : (n == 8 && teamA.length == 4 && teamB.length == 4)
+                  ? const [5, 4, 6, 7]
+                  : [
+                      for (var i = 0; i < n; i++)
+                        if (!aCells.contains(i)) i,
+                    ];
       final byCell = List<LivePkSide?>.filled(n, null);
       var qi = 0;
       for (var i = 0; i < teamA.length; i++) {
@@ -623,8 +838,28 @@ List<_PkCell> _layoutCells(LivePkState s) {
       for (final p in teamB) {
         if (qi < queue.length) byCell[queue[qi++]] = p;
       }
+      final ordered = [
+        for (var i = 0; i < n; i++)
+          if (byCell[i] != null) byCell[i]!,
+      ];
+      if (n == 5) return _fiveCells(ordered);
       final cols2 = _columnsFor(n);
       final rows2 = (n / cols2).ceil();
+      // 6/8/9 人列优先：cell i → 列 i~/rows、行 i%rows
+      // （8 人 4v4 2026-09-14：行优先粉队占上排左二，官方是左两列）
+      if (n == 6 || n == 8 || n == 9) {
+        return [
+          for (var i = 0; i < n; i++)
+            if (byCell[i] != null)
+              _PkCell(
+                byCell[i]!,
+                left: (i ~/ rows2) / cols2,
+                top: (i % rows2) / rows2,
+                width: 1 / cols2,
+                height: 1 / rows2,
+              ),
+        ];
+      }
       return [
         for (var i = 0; i < n; i++)
           if (byCell[i] != null)
@@ -637,15 +872,54 @@ List<_PkCell> _layoutCells(LivePkState s) {
             ),
       ];
     }
+    }
   }
   final cols = _columnsFor(n);
   final rows = (n / cols).ceil();
+  // 4/8 人乱斗：行优先，不按名次重排（participants 已是本房提前或 8 人旋转）。
+  // 4 人 2026-09-14 辰曦房 3↔4：列优先+名次把右下/左下放反，行优先+加入序即对。
+  // 8 人 2026-09-14：4x2 行优先 + 从本房旋转加入序。
+  if (n == 4 || n == 8) {
+    return [
+      for (var i = 0; i < n; i++)
+        _PkCell(
+          s.participants[i],
+          left: (i % cols) / cols,
+          top: (i ~/ cols) / rows,
+          width: 1 / cols,
+          height: 1 / rows,
+        ),
+    ];
+  }
+  // 6人/4人 乱斗 column-major 填充：本房固定 idx0，其余按名次升序排入
+  //剩余 column-major 位置（2026-09-14 4 人局实测：idx0=本房 rank3、
+  // idx1=rank2、idx2=rank1、idx3=rank4；column-major 名次升序契合）
+  final list = s.participants.toList();
+  LivePkSide? local;
+  final rest = <LivePkSide>[];
+  for (final p in list) {
+    if (p.userId == s.localUserId && local == null) {
+      local = p;
+    } else {
+      rest.add(p);
+    }
+  }
+  local ??= list.isNotEmpty ? list.first : null;
+  // 其余名次升序（rank 小=名次高=row 0 col 1 在 idx 1）。缺名次按 uid 稳定
+  rest.sort((a, b) {
+    if (a.rank > 0 && b.rank > 0 && a.rank != b.rank) return a.rank.compareTo(b.rank);
+    if (a.rank > 0 && b.rank == 0) return -1;
+    if (a.rank == 0 && b.rank > 0) return 1;
+    return a.userId.compareTo(b.userId);
+  });
+  final ordered = [if (local != null) local, ...rest];
+  if (n == 5) return _fiveCells(ordered);
   return [
     for (var i = 0; i < n; i++)
       _PkCell(
-        s.participants[i],
-        left: (i % cols) / cols,
-        top: (i ~/ cols) / rows,
+        ordered[i],
+        left: (i ~/ rows) / cols,
+        top: (i % rows) / rows,
         width: 1 / cols,
         height: 1 / rows,
       ),
@@ -664,6 +938,10 @@ class DouyinPkGridOverlay extends StatelessWidget {
   final double width;
   final double height;
   final bool hasBattle;
+
+  /// PK 全程结束（含 60s 惩罚读完）：分值徽章不显示（只留名字）
+  final bool pkOver;
+
   final double scale;
   final String localNickname;
 
@@ -673,6 +951,7 @@ class DouyinPkGridOverlay extends StatelessWidget {
     required this.width,
     required this.height,
     required this.hasBattle,
+    required this.pkOver,
     this.scale = 1.0,
     this.localNickname = '',
   });
@@ -717,8 +996,9 @@ class DouyinPkGridOverlay extends StatelessWidget {
             height: cell.height * height,
             child: _PkCellBadge(
               side: cell.side,
-              showScore: showScoresInBattle ||
-                  (!hasBattle && cell.side.score > 0),
+              showScore: (showScoresInBattle ||
+                      (!hasBattle && cell.side.score > 0)) &&
+                  !pkOver,
               scale: scale * cellBadgeScale(cell),
               nameScale: nameScale,
               // 乱斗局（无队伍分）用金冠/灰底蓝圈徽章，不用队色。
@@ -795,8 +1075,9 @@ class _PkCellBadge extends StatelessWidget {
       scoreColor = isRank1 ? const Color(0xFF4A3A0D) : Colors.white;
     } else {
       pillDecoration = BoxDecoration(
+        // 粉/蓝队色底，50% 不透明（2026-09-14 用户口径，透出画面）
         color: (isOpponent ? const Color(0xFF378ADD) : const Color(0xFFE24B8A))
-            .withOpacity(0.9),
+            .withValues(alpha: 0.5),
         borderRadius: BorderRadius.circular(10 * ds),
       );
       scoreColor = Colors.white;
@@ -992,8 +1273,8 @@ class DouyinViewerCountBadge extends StatelessWidget {
     return Container(
       padding: EdgeInsets.symmetric(horizontal: 8 * ds, vertical: 2 * ds),
       decoration: BoxDecoration(
-        // 网页版取样：底 (15,16,19) 近黑 ~85%、字 (255,0,0) 纯红
-        color: const Color(0xD90F1013),
+        // 用户调参：底 (15,16,19) 不透明度 30%（2026-09-14）
+        color: const Color(0x4D0F1013),
         borderRadius: BorderRadius.circular(4 * ds),
       ),
       child: Text(

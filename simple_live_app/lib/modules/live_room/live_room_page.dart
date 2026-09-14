@@ -736,8 +736,10 @@ class LiveRoomPage extends GetView<LiveRoomController> {
                   final w = controller.player.state.width ?? 0;
                   final h = controller.player.state.height ?? 0;
                   if (w > 0 && h > 0) return w / h;
-                  // 播放器未上报分辨率时的兜底（部分直播流 media_kit 拿不到 dims）
-                  return controller.isVertical.value ? 9 / 16 : 16 / 9;
+                  // 分辨率未知（视频未加载）：返回 0 让 PK 层按整窗定位，
+                  // 标题/角标贴窗口顶部；否则猜测宽高比会把标题悬在半空
+                  //（2026-09-13 实测：横屏直播加载中标题飘到窗口中部偏上）
+                  return 0.0;
                 },
                 scaleModeProvider: () =>
                     AppSettingsController.instance.scaleMode.value,
