@@ -602,6 +602,7 @@ class DouyinDanmaku implements LiveDanmaku {
       // ---- 新协议（2026-09 实测在用）----
       else if (msg.method == 'WebcastBattleStatusMessage') {
         _pkDebug("PK2-status 收到 payload=${msg.payload.length}B");
+        _pkDumpPayload("bs_${msg.method}", msg.payload);
         pkTracker.onBattleStatus(msg.payload);
       } else if (msg.method == 'WebcastLinkmicPlayModeUpdateScoreMessage') {
         _pkDebug("PK2-score 收到 payload=${msg.payload.length}B");
