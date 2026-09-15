@@ -671,6 +671,8 @@ class DouyinPkTracker {
     _nHasTeamScores = false;
     _ringCycle.clear();
     _ringStreak = 0;
+    _manualSwapPairs.clear();
+    _ringStreak = 0;
     _linkMembers.clear();
     _linkMembersAt = 0;
   }
@@ -775,6 +777,8 @@ class DouyinPkTracker {
       _teamMap.clear();
       _profile.clear();
       _ringCycle.clear();
+      _ringStreak = 0;
+      _manualSwapPairs.clear();
     _ringStreak = 0;
       // 同步新协议战斗上下文，让 _battleFinished() 放行本局增量同步
       //（否则旧 start 会让新局 syncs 全部被拒、旧人清不掉）
@@ -1102,9 +1106,16 @@ class DouyinPkTracker {
   /// user_scores 几乎总是先到，座位被丢掉（2026-09-14 三轮 6 人证伪）
   final Map<int, int> _uiSeat = <int, int>{};
 
-  /// 手动调整的格子顺序偏移（uidA -> uidB），用于应对抖音无座位表下发的
-  /// 特殊情况，当前战局内持久生效
-  final Map<int, int> _manualSwaps = <int, int>{};
+  /// 手动调整的格子顺序：用户点选交换的 uid 对（按操作顺序），当前
+  /// 战局内持久生效（换局/清场即清）。应用于 _rebuildNew 的 ids 终序
+  final List<List<int>> _manualSwapPairs = <List<int>>[];
+
+  /// 手动交换两个主播的格子（UI 点选触发）：记录 uid 对并立即重排
+  void registerManualSwap(int uidA, int uidB) {
+    if (uidA == 0 || uidB == 0 || uidA == uidB) return;
+    _manualSwapPairs.add([uidA, uidB]);
+    _rebuildNew();
+  }
   /// 放大构图确认开启：房间详情 enlarge_guest 标记（定时刷新注入）或
   /// EnlargeGuest 消息。2 人局=全屏+小窗构图，多人=左大格+右侧小格
   bool _nPipMode = false;
@@ -1722,6 +1733,8 @@ class DouyinPkTracker {
     _nSawScores = false;
     _ringCycle.clear();
     _ringStreak = 0;
+    _manualSwapPairs.clear();
+    _ringStreak = 0;
     _state = LivePkState(lastUpdateMs: DateTime.now().millisecondsSinceEpoch);
     _emit();
   }
@@ -1791,6 +1804,19 @@ class DouyinPkTracker {
     } else {
       seated = false;
       ids = List<int>.of(_nOrder);
+    }
+    // 手动交换：把用户点选的 uid 对在格子序里两两互换（按操作顺序复合）。
+    // 每次同步重算 ids 后都会重新应用，当前战局内持久生效
+    if (_manualSwapPairs.isNotEmpty) {
+      for (final pair in _manualSwapPairs) {
+        final i = ids.indexOf(pair[0]);
+        final j = ids.indexOf(pair[1]);
+        if (i >= 0 && j >= 0 && i != j) {
+          final t = ids[i];
+          ids[i] = ids[j];
+          ids[j] = t;
+        }
+      }
     }
     final parts = <LivePkSide>[];
     for (final id in ids) {

@@ -47,6 +47,10 @@ class DouyinPkLayer extends StatefulWidget {
   /// PK 期间下移避让进度条，与观看人数角标同排
   final String title;
 
+  /// 手动交换回调（uidA, uidB）：交换模式下点选两个格子后触发，
+  /// 由外部转发到 pkTracker.registerManualSwap
+  final void Function(int uidA, int uidB)? onManualSwap;
+
   const DouyinPkLayer({
     super.key,
     required this.state,
@@ -56,6 +60,7 @@ class DouyinPkLayer extends StatefulWidget {
     this.viewerCount,
     this.localNickname = '',
     this.title = '',
+    this.onManualSwap,
   });
 
   @override
@@ -64,6 +69,12 @@ class DouyinPkLayer extends StatefulWidget {
 
 class _DouyinPkLayerState extends State<DouyinPkLayer> {
   Timer? _ticker;
+
+  /// 手动交换模式：true 时格子可点击，点选两格交换位置
+  bool _swapMode = false;
+
+  /// 交换模式下的第一个被选中格子（uid）
+  int? _swapPickUid;
 
   @override
   void initState() {
@@ -77,6 +88,20 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
   void dispose() {
     _ticker?.cancel();
     super.dispose();
+  }
+
+  /// 交换模式的格子点击：第一击选中、第二击与另一格触发交换
+  void _handleCellTap(int uid) {
+    setState(() {
+      if (_swapPickUid == null) {
+        _swapPickUid = uid;
+      } else if (_swapPickUid == uid) {
+        _swapPickUid = null;
+      } else {
+        widget.onManualSwap?.call(_swapPickUid!, uid);
+        _swapPickUid = null;
+      }
+    });
   }
 
   /// BoxFit.contain 下视频在控件内的实际显示矩形。
@@ -148,24 +173,26 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                     top: 8 * scale,
                     left: 0,
                     width: c.maxWidth,
-                    child: Center(
-                      child: ConstrainedBox(
-                        constraints:
-                            BoxConstraints(maxWidth: c.maxWidth * 0.52),
-                        child: Container(
-                          padding: EdgeInsets.symmetric(
-                              horizontal: 10 * scale, vertical: 3 * scale),
-                          decoration: BoxDecoration(
-                            color: const Color(0xD90F1013),
-                            borderRadius: BorderRadius.circular(5 * scale),
-                          ),
-                          child: Text(
-                            widget.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 13 * scale,
+                    child: IgnorePointer(
+                      child: Center(
+                        child: ConstrainedBox(
+                          constraints:
+                              BoxConstraints(maxWidth: c.maxWidth * 0.52),
+                          child: Container(
+                            padding: EdgeInsets.symmetric(
+                                horizontal: 10 * scale, vertical: 3 * scale),
+                            decoration: BoxDecoration(
+                              color: const Color(0xD90F1013),
+                              borderRadius: BorderRadius.circular(5 * scale),
+                            ),
+                            child: Text(
+                              widget.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 13 * scale,
+                              ),
                             ),
                           ),
                         ),
@@ -178,12 +205,14 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                     top: 8 * scale,
                     left: 0,
                     width: c.maxWidth,
-                    child: Align(
-                      alignment: Alignment.topRight,
-                      child: Padding(
-                        padding: EdgeInsets.only(right: 12 * scale),
-                        child: DouyinViewerCountBadge(
-                            count: viewers, scale: scale),
+                    child: IgnorePointer(
+                      child: Align(
+                        alignment: Alignment.topRight,
+                        child: Padding(
+                          padding: EdgeInsets.only(right: 12 * scale),
+                          child: DouyinViewerCountBadge(
+                              count: viewers, scale: scale),
+                        ),
                       ),
                     ),
                   ),
@@ -219,24 +248,26 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                   top: 8 * scale,
                   left: 0,
                   width: c.maxWidth,
-                  child: Center(
-                    child: ConstrainedBox(
-                      constraints:
-                          BoxConstraints(maxWidth: c.maxWidth * 0.52),
-                      child: Container(
-                        padding: EdgeInsets.symmetric(
-                            horizontal: 10 * scale, vertical: 3 * scale),
-                        decoration: BoxDecoration(
-                          color: const Color(0xD90F1013),
-                          borderRadius: BorderRadius.circular(5 * scale),
-                        ),
-                        child: Text(
-                          widget.title,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 13 * scale,
+                  child: IgnorePointer(
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints:
+                            BoxConstraints(maxWidth: c.maxWidth * 0.52),
+                        child: Container(
+                          padding: EdgeInsets.symmetric(
+                              horizontal: 10 * scale, vertical: 3 * scale),
+                          decoration: BoxDecoration(
+                            color: const Color(0xD90F1013),
+                            borderRadius: BorderRadius.circular(5 * scale),
+                          ),
+                          child: Text(
+                            widget.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 13 * scale,
+                            ),
                           ),
                         ),
                       ),
@@ -252,9 +283,11 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                   top: rect.top + 50 * scale,
                   left: rect.left,
                   width: rect.width,
-                  child: Center(
-                    child: DouyinPkBar(
-                        state: s, nowMs: widget.nowMs, scale: scale),
+                  child: IgnorePointer(
+                    child: Center(
+                      child: DouyinPkBar(
+                          state: s, nowMs: widget.nowMs, scale: scale),
+                    ),
                   ),
                 ),
               // 个人赛：紧凑倒计时（仿抖音「PK 06:51」样式）
@@ -263,13 +296,16 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                   top: rect.top + 50 * scale,
                   left: rect.left,
                   width: rect.width,
-                  child: Center(
-                    child: DouyinPkCountdownChip(
-                        state: s, nowMs: widget.nowMs, scale: scale),
+                  child: IgnorePointer(
+                    child: Center(
+                      child: DouyinPkCountdownChip(
+                          state: s, nowMs: widget.nowMs, scale: scale),
+                    ),
                   ),
                 ),
               // 格子徽章（count>=2）：叠加在合成画面的格子上。
-              // 状态超时 15 秒无更新（对方中途退出连线）时隐去，防徽章挂屏
+              // 状态超时 15 秒无更新（对方中途退出连线）时隐去，防徽章挂屏。
+              // 交换模式下格子可点击（点选两格互换），其余时候不响应指针
               if (s.count >= 2 && !stale)
                 Positioned(
                   left: rect.left,
@@ -283,17 +319,75 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                       (s.count == 2
                           ? 0.60
                           : (s.bigMode ? 1.0 : 0.50)),
-                  child: DouyinPkGridOverlay(
-                    state: s,
-                    width: rect.width,
-                    height: rect.height *
-                        (s.count == 2
-                            ? 0.60
-                            : (s.bigMode ? 1.0 : 0.50)),
-                    hasBattle: hasBattle,
-                    pkOver: pkOver,
-                    scale: scale,
-                    localNickname: widget.localNickname,
+                  child: IgnorePointer(
+                    ignoring: !_swapMode,
+                    child: DouyinPkGridOverlay(
+                      state: s,
+                      width: rect.width,
+                      height: rect.height *
+                          (s.count == 2
+                              ? 0.60
+                              : (s.bigMode ? 1.0 : 0.50)),
+                      hasBattle: hasBattle,
+                      pkOver: pkOver,
+                      scale: scale,
+                      localNickname: widget.localNickname,
+                      swapMode: _swapMode,
+                      selectedUid: _swapPickUid,
+                      onCellTap: _handleCellTap,
+                    ),
+                  ),
+                ),
+              // 手动交换开关（左上角 ⇄）：进入交换模式后点选两格互换
+              if (s != null && s.count >= 2 && !stale)
+                Positioned(
+                  left: rect.left + 6 * scale,
+                  top: rect.top + 8 * scale,
+                  child: GestureDetector(
+                    onTap: () => setState(() {
+                      _swapMode = !_swapMode;
+                      _swapPickUid = null;
+                    }),
+                    child: Container(
+                      padding: EdgeInsets.symmetric(
+                          horizontal: 8 * scale, vertical: 4 * scale),
+                      decoration: BoxDecoration(
+                        color: _swapMode
+                            ? const Color(0xE6FE2C55)
+                            : const Color(0xD90F1013),
+                        borderRadius: BorderRadius.circular(6 * scale),
+                      ),
+                      child: Text(
+                        _swapMode ? '完成' : '⇄',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 12 * scale,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              if (_swapMode && s != null && s.count >= 2)
+                Positioned(
+                  left: rect.left + 52 * scale,
+                  top: rect.top + 10 * scale,
+                  child: Container(
+                    padding: EdgeInsets.symmetric(
+                        horizontal: 8 * scale, vertical: 4 * scale),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.55),
+                      borderRadius: BorderRadius.circular(6 * scale),
+                    ),
+                    child: Text(
+                      _swapPickUid == null
+                          ? '交换模式：点击两个格子互换位置'
+                          : '已选中，点击另一格完成交换',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 11 * scale,
+                      ),
+                    ),
                   ),
                 ),
               // 右上角：实时观看人数（标题存在时与标题同排，人数靠右）
@@ -302,12 +396,14 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                   top: badgeTop,
                   left: 0,
                   width: c.maxWidth,
-                  child: Align(
-                    alignment: Alignment.topRight,
-                    child: Padding(
-                      padding: EdgeInsets.only(right: 12 * scale),
-                      child: DouyinViewerCountBadge(
-                          count: viewers, scale: scale),
+                  child: IgnorePointer(
+                    child: Align(
+                      alignment: Alignment.topRight,
+                      child: Padding(
+                        padding: EdgeInsets.only(right: 12 * scale),
+                        child: DouyinViewerCountBadge(
+                            count: viewers, scale: scale),
+                      ),
                     ),
                   ),
                 ),
@@ -970,6 +1066,11 @@ class DouyinPkGridOverlay extends StatelessWidget {
   final double scale;
   final String localNickname;
 
+  /// 手动交换模式：格子可点击、选中格高亮
+  final bool swapMode;
+  final int? selectedUid;
+  final void Function(int uid)? onCellTap;
+
   const DouyinPkGridOverlay({
     super.key,
     required this.state,
@@ -979,6 +1080,9 @@ class DouyinPkGridOverlay extends StatelessWidget {
     required this.pkOver,
     this.scale = 1.0,
     this.localNickname = '',
+    this.swapMode = false,
+    this.selectedUid,
+    this.onCellTap,
   });
 
   @override
@@ -1019,25 +1123,31 @@ class DouyinPkGridOverlay extends StatelessWidget {
             top: cell.top * height,
             width: cell.width * width,
             height: cell.height * height,
-            child: _PkCellBadge(
-              side: cell.side,
-              showScore: (showScoresInBattle ||
-                      (!hasBattle && cell.side.score > 0)) &&
-                  !pkOver,
-              scale: scale * cellBadgeScale(cell),
-              nameScale: nameScale,
-              // 乱斗局（无队伍分）用金冠/灰底蓝圈徽章，不用队色。
-              // 不能挂在 hasBattle 上：PK 倒计时走完/惩罚走完的窗口里
-              // hasBattle=false（条和倒计时消失），徽章配色若跟着变
-              // 会出现"瞬间变回粉色再变回来"的闪跳（2026-09-13 实测）
-              ffa: !state.teamBattle,
-              isOpponent: localTeam != null &&
-                  cell.side.teamId != 0 &&
-                  cell.side.teamId != localTeam,
-              displayName: cell.side.userId == state.localUserId &&
-                      localNickname.isNotEmpty
-                  ? localNickname
+            child: GestureDetector(
+              onTap: swapMode && onCellTap != null
+                  ? () => onCellTap!(cell.side.userId)
                   : null,
+              child: _PkCellBadge(
+                side: cell.side,
+                showScore: (showScoresInBattle ||
+                        (!hasBattle && cell.side.score > 0)) &&
+                    !pkOver,
+                scale: scale * cellBadgeScale(cell),
+                nameScale: nameScale,
+                // 乱斗局（无队伍分）用金冠/灰底蓝圈徽章，不用队色。
+                // 不能挂在 hasBattle 上：PK 倒计时走完/惩罚走完的窗口里
+                // hasBattle=false（条和倒计时消失），徽章配色若跟着变
+                // 会出现"瞬间变回粉色再变回来"的闪跳（2026-09-13 实测）
+                ffa: !state.teamBattle,
+                isOpponent: localTeam != null &&
+                    cell.side.teamId != 0 &&
+                    cell.side.teamId != localTeam,
+                displayName: cell.side.userId == state.localUserId &&
+                        localNickname.isNotEmpty
+                    ? localNickname
+                    : null,
+                selected: swapMode && selectedUid == cell.side.userId,
+              ),
             ),
           ),
       ],
@@ -1063,6 +1173,9 @@ class _PkCellBadge extends StatelessWidget {
   /// 名字统一字号缩放（全格一致，由 GridOverlay 按最长名计算）
   final double nameScale;
 
+  /// 交换模式下被选中（高亮描边）
+  final bool selected;
+
   const _PkCellBadge({
     required this.side,
     required this.showScore,
@@ -1071,6 +1184,7 @@ class _PkCellBadge extends StatelessWidget {
     this.ffa = false,
     this.displayName,
     this.nameScale = 1.0,
+    this.selected = false,
   });
 
   @override
@@ -1188,7 +1302,18 @@ class _PkCellBadge extends StatelessWidget {
 
     return Padding(
       padding: EdgeInsets.all(6 * ds),
-      child: Row(
+      child: Container(
+        decoration: selected
+            ? BoxDecoration(
+                border: Border.all(
+                  color: const Color(0xFFFFC53D),
+                  width: 2 * ds,
+                ),
+                borderRadius: BorderRadius.circular(8 * ds),
+              )
+            : null,
+        padding: selected ? EdgeInsets.all(2 * ds) : null,
+        child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
@@ -1240,7 +1365,8 @@ class _PkCellBadge extends StatelessWidget {
             ),
           ),
         ],
-      ),
+        ),
+        ),
     );
   }
 }

@@ -709,41 +709,48 @@ class LiveRoomPage extends GetView<LiveRoomController> {
           // 自己实现
           wakelock: false,
         ),
-        // 抖音 PK 分数层：只在 PK 期间渲染；IgnorePointer 避免挡住播放器控件。
+        // 抖音 PK 分数层：只在 PK 期间渲染。
+        // 指针忽略已在 DouyinPkLayer 内部按子元素处理（交换模式需要
+        // 格子可点击，其余覆盖层仍忽略指针），这里不再包 IgnorePointer。
         // 不用 Obx 包 player.state：media_kit 状态非 Rx，Obx 会报"无响应式依赖"。
         // 尺寸通过函数提供器在内部 LayoutBuilder / 每秒 ticker 里获取。
         if (!pipMode)
           Positioned.fill(
-            child: IgnorePointer(
-              child: DouyinPkLayer(
-                state: controller.pkState,
-                // 抖音实时观看人数（RoomUserSeq → online），仅抖音站传入；
-                // Rx 在 layer 内部 Obx 里读取，人数刷新只重建覆盖层
-                viewerCount: controller.site.id == Constant.kDouyin
-                    ? controller.online
-                    : null,
-                // 本房主播真名（房间详情 HTTP 接口；WS 消息不含昵称）
-                localNickname: controller.detail.value?.userName ?? '',
-                // 直播间标题（仿网页版顶部胶囊，PK 时下移避让进度条）
-                title: controller.detail.value?.title ?? '',
-                nowMs: () {
-                  final dm = controller.liveDanmaku;
-                  return dm is DouyinDanmaku
-                      ? dm.pkTracker.nowMs
-                      : DateTime.now().millisecondsSinceEpoch;
-                },
-                videoAspectRatioProvider: () {
-                  final w = controller.player.state.width ?? 0;
-                  final h = controller.player.state.height ?? 0;
-                  if (w > 0 && h > 0) return w / h;
-                  // 分辨率未知（视频未加载）：返回 0 让 PK 层按整窗定位，
-                  // 标题/角标贴窗口顶部；否则猜测宽高比会把标题悬在半空
-                  //（2026-09-13 实测：横屏直播加载中标题飘到窗口中部偏上）
-                  return 0.0;
-                },
-                scaleModeProvider: () =>
-                    AppSettingsController.instance.scaleMode.value,
-              ),
+            child: DouyinPkLayer(
+              state: controller.pkState,
+              // 抖音实时观看人数（RoomUserSeq → online），仅抖音站传入；
+              // Rx 在 layer 内部 Obx 里读取，人数刷新只重建覆盖层
+              viewerCount: controller.site.id == Constant.kDouyin
+                  ? controller.online
+                  : null,
+              // 本房主播真名（房间详情 HTTP 接口；WS 消息不含昵称）
+              localNickname: controller.detail.value?.userName ?? '',
+              // 直播间标题（仿网页版顶部胶囊，PK 时下移避让进度条）
+              title: controller.detail.value?.title ?? '',
+              // 手动交换：交换模式点选两格后转发到 tracker
+              onManualSwap: (uidA, uidB) {
+                final dm = controller.liveDanmaku;
+                if (dm is DouyinDanmaku) {
+                  dm.pkTracker.registerManualSwap(uidA, uidB);
+                }
+              },
+              nowMs: () {
+                final dm = controller.liveDanmaku;
+                return dm is DouyinDanmaku
+                    ? dm.pkTracker.nowMs
+                    : DateTime.now().millisecondsSinceEpoch;
+              },
+              videoAspectRatioProvider: () {
+                final w = controller.player.state.width ?? 0;
+                final h = controller.player.state.height ?? 0;
+                if (w > 0 && h > 0) return w / h;
+                // 分辨率未知（视频未加载）：返回 0 让 PK 层按整窗定位，
+                // 标题/角标贴窗口顶部；否则猜测宽高比会把标题悬在半空
+                //（2026-09-13 实测：横屏直播加载中标题飘到窗口中部偏上）
+                return 0.0;
+              },
+              scaleModeProvider: () =>
+                  AppSettingsController.instance.scaleMode.value,
             ),
           ),
         if (!pipMode)
