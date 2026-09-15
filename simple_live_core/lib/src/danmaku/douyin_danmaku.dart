@@ -75,11 +75,37 @@ class DouyinDanmaku implements LiveDanmaku {
       final dir = Directory('${Directory.systemTemp.path}/pk_dump');
       dir.createSync(recursive: true);
       final safe = method.replaceAll(RegExp(r'[^A-Za-z0-9]'), '_');
-      final f = File('${dir.path}/${safe}_$_pkDumpSeq.bin');
+      // 文件名带连接会话标签：dump 计数器每条连接从 0 重来，
+      // 不加标签会跨会话同名互相覆盖（2026-09-15 排查 2v2 时被坑）
+      final f = File('${dir.path}/${safe}_${_pkSessionTag}_$_pkDumpSeq.bin');
       _pkDumpSeq++;
       f.writeAsBytesSync(payload, flush: true);
       _pkDebug("DUMP ${f.path} (${payload.length}B)");
     } catch (_) {}
+  }
+
+  /// 本条弹幕连接的会话标签（HHmmss），用于 dump 文件名防碰撞
+  late final String _pkSessionTag = _newSessionTag();
+  static String _newSessionTag() {
+    final n = DateTime.now();
+    return '${n.hour.toString().padLeft(2, '0')}'
+        '${n.minute.toString().padLeft(2, '0')}'
+        '${n.second.toString().padLeft(2, '0')}';
+  }
+
+  // ---- SYNCORDER 日志（变化检测 + 限量）----
+  String? _lastSyncSig;
+  int _syncLogCount = 0;
+
+  /// 每包 user_scores/linked_users 数组序：仅在序变化（或首包）时记录，
+  /// 最多 40 条/连接——验证「首包序=进频道序=格子序」假设用
+  void _logSyncOrder() {
+    final sig = pkTracker.debugSyncSignature;
+    if (sig == _lastSyncSig) return;
+    _lastSyncSig = sig;
+    if (_syncLogCount >= 40) return; // 乱序房间每包都变，限量防刷屏
+    _syncLogCount++;
+    _pkDebug("SYNCORDER $sig${_syncLogCount >= 40 ? ' (达到上限，后续变化不再记录)' : ''}");
   }
 
   /// 追加一行到 %TEMP%\simple_live_pk_debug.log；超过 8MB 自动轮换：
@@ -588,6 +614,7 @@ class DouyinDanmaku implements LiveDanmaku {
       } else if (msg.method == 'WebcastLinkMicBattleMethod' ||
           msg.method == 'WebcastLinkMicBattle') {
         _pkDebug("PK-battle(旧) 收到 payload=${msg.payload.length}B");
+        _pkDumpPayload("battle_${msg.method}", msg.payload);
         pkTracker.onBattle(msg.payload);
       } else if (msg.method == 'WebcastLinkMicArmiesMethod' ||
           msg.method == 'WebcastLinkMicArmies') {
@@ -616,6 +643,7 @@ class DouyinDanmaku implements LiveDanmaku {
           _linkmicDumpSeq++;
         }
         pkTracker.onLinkMicMethod(msg.payload);
+        _logSyncOrder();
       } else if (msg.method == 'WebcastLinkmicUIMessage') {
         if (_uiDumpSeq < 20) {
           _pkDumpPayload("ui${_uiDumpSeq}_${msg.method}", msg.payload,

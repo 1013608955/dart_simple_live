@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
@@ -325,12 +326,24 @@ class DouyinPkBar extends StatelessWidget {
   final int Function() nowMs;
   final double scale;
 
+  /// PK 计时诊断开关：true 时每次 build 打印 nowMs/startMs/durMs/endAt/remainMs/inPunish
+  /// 用于诊断 PK 条倒计时偏差（如软件 vs 网页差几分钟的问题）
+  static bool diagnosePkTimer = false;
+
   const DouyinPkBar({
     super.key,
     required this.state,
     required this.nowMs,
     this.scale = 1.0,
   });
+
+  void _pkDebug(String line) {
+    try {
+      final f =
+          File('${Directory.systemTemp.path}/simple_live_pk_debug.log');
+      f.writeAsStringSync("$line\n", mode: FileMode.append);
+    } catch (_) {}
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -374,6 +387,13 @@ class DouyinPkBar extends StatelessWidget {
     final endAt = state.startTimeMs + state.durationMs;
     final inPunish =
         state.durationMs > 0 && state.startTimeMs > 0 && nowMs() >= endAt;
+    // DIAG: 打印 UI 端实际计算用的时间值，便于诊断 PK 条倒计时偏差
+    if (diagnosePkTimer) {
+      _pkDebug(
+        "PK-TIMER nowMs=${nowMs()} startMs=${state.startTimeMs} durMs=${state.durationMs} "
+        "endAt=$endAt remainMs=$remain inPunish=$inPunish phase=${state.phase}",
+      );
+    }
     final label = inPunish
         ? _punishLabel(state, nowMs())
         : (state.durationMs > 0 ? '$mm:$ss' : 'PK');
@@ -786,9 +806,14 @@ List<_PkCell> _layoutCells(LivePkState s) {
           // 4x2 列优先（左列 0/1、中左 2/3、中右 4/5、右列 6/7）。
           // 2026-09-14 4v4 实测：粉队占左两列 [0,1,2,3]；旧值 [0,1,4,5]
           // 配行优先会把粉队铺成上排左二+下排左二，用户报 2↔5。
+          // 2026-09-15 春虫虫房 7v1 实测：单人队占右上=byCell 6（列优先
+          // 几何下 visual 右上是 (3,0)=cell 6，不是行优先的 cell 3！），
+          // 多数队填其余 7 格 [0,1,2,3,4,5,7]；对齐 4 人局 (3,1) 单人右上先例
           aCells = switch ((teamA.length, teamB.length)) {
             (3, 5) => const [0, 1, 2],
             (5, 3) => const [0, 1, 2, 3, 4],
+            (7, 1) => const [0, 1, 2, 3, 4, 5, 7],
+            (1, 7) => const [0],
             _ => const [0, 1, 2, 3], // 4v4
           };
           break;
@@ -796,10 +821,14 @@ List<_PkCell> _layoutCells(LivePkState s) {
           // 3x3 列优先（左列 0/1/2、中列 3/4/5、右列 6/7/8）。
           // 2026-09-14 桁菜房 4v5 实测：粉队=左列+中上 [0,1,2,3]
           // （桁菜/赵俊杰/光天翌/Li敖），蓝队占剩余。
+          // 2026-09-15 KONGCAKE 房 1v8：本房单人占 TL [0]，8 人填其余；
+          // (8,1) 单人队按右上惯例占 byCell 6（列优先 visual 右上）。
           aCells = switch ((teamA.length, teamB.length)) {
             (5, 4) => const [0, 1, 2, 3, 4],
             (3, 6) => const [0, 1, 2],
             (6, 3) => const [0, 1, 2, 3, 4, 5],
+            (1, 8) => const [0],
+            (8, 1) => const [0, 1, 2, 3, 4, 5, 7, 8],
             _ => const [0, 1, 2, 3], // 4v5 默认
           };
           break;
@@ -892,9 +921,11 @@ List<_PkCell> _layoutCells(LivePkState s) {
         ),
     ];
   }
-  // 6人/4人 乱斗 column-major 填充：本房固定 idx0，其余按名次升序排入
-  //剩余 column-major 位置（2026-09-14 4 人局实测：idx0=本房 rank3、
-  // idx1=rank2、idx2=rank1、idx3=rank4；column-major 名次升序契合）
+  // 乱斗（无队伍分）：本房固定 idx0，其余保持加入序（首见序）。
+  // 不按名次排序：官方乱斗布局=加入序，名次序与网页版不符且会随分数
+  // 变化整局重排（2026-09-15 9 人乱斗实测：网页版顺序对应名次
+  // [2,4,5,6,1,7,8,3,9]，非名次序；2026-09-14 4 人局的"名次契合"是
+  // 名次恰与加入序重合的巧合）。中途进房加入序不可恢复，但稳定不跳。
   final list = s.participants.toList();
   LivePkSide? local;
   final rest = <LivePkSide>[];
@@ -906,13 +937,6 @@ List<_PkCell> _layoutCells(LivePkState s) {
     }
   }
   local ??= list.isNotEmpty ? list.first : null;
-  // 其余名次升序（rank 小=名次高=row 0 col 1 在 idx 1）。缺名次按 uid 稳定
-  rest.sort((a, b) {
-    if (a.rank > 0 && b.rank > 0 && a.rank != b.rank) return a.rank.compareTo(b.rank);
-    if (a.rank > 0 && b.rank == 0) return -1;
-    if (a.rank == 0 && b.rank > 0) return 1;
-    return a.userId.compareTo(b.userId);
-  });
   final ordered = [if (local != null) local, ...rest];
   if (n == 5) return _fiveCells(ordered);
   return [

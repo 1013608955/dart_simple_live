@@ -333,6 +333,64 @@ class DouyinPkTracker {
   /// 每人最新分数
   final Map<int, int> _latestScores = <int, int>{};
 
+  /// 上一条 battle 消息的战局号：变了 = 新战局开始，需清旧局残留。
+  /// 2026-09-15 春虫虫房实测：1v1 换对手后画面混入上一局主播
+  /// （幼琳 连人带 8723 旧分）——_profile/_latestScores 只在退出房间
+  /// 时 reset()，局与局之间从不清，上一局的人被 _rebuild 拼进新一局
+  int _lastBattleId = 0;
+
+  /// 最新连麦名单快照（WebcastLinkMessage f13/f9 的 uid 集合，≥2 人才记）
+  final Set<int> _linkMembers = <int>{};
+  int _linkMembersAt = 0;
+
+  /// user_scores 环序：数组每包是同一循环的不同旋转，环本身是参与者
+  /// 的稳定相对序（2026-09-15/16 实测：8 人组队与 8 人乱斗均为旋转环；
+  /// 9 人乱斗为逐包乱序）。布局时旋转到本房首位
+  List<int> _ringCycle = <int>[];
+
+  /// 连续"新包是当前环的旋转"的次数（乱序战局自动禁用环序的门控）
+  int _ringStreak = 0;
+
+  /// packet 是否为 cycle 的循环旋转（等长、同成员集、环上逐位吻合）
+  static bool _isSameRingRotation(List<int> cycle, List<int> packet) {
+    if (cycle.length != packet.length || cycle.length < 2) return false;
+    final setA = cycle.toSet();
+    if (setA.length != cycle.length) return false;
+    if (!setA.containsAll(packet.toSet())) return false;
+    final doubled = [...cycle, ...cycle];
+    for (var i = 0; i < cycle.length; i++) {
+      var ok = true;
+      for (var j = 0; j < packet.length; j++) {
+        if (doubled[i + j] != packet[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  }
+
+  /// 环序旋转到本房首位并过滤为当前在场成员；环不覆盖全员、或尚未
+  /// 连续 ≥5 包验证为旋转环时返回 null（退回首见序）
+  List<int>? _ringRotatedToLocal() {
+    if (_ringCycle.isEmpty || _nOrder.isEmpty || _ringStreak < 5) return null;
+    final members =
+        _ringCycle.where(_nOrder.contains).toList();
+    if (members.length != _nOrder.length) return null;
+    final li = _nLocalId != 0 ? members.indexOf(_nLocalId) : -1;
+    if (li <= 0) return members;
+    return [
+      ...members.sublist(li),
+      ...members.sublist(0, li),
+    ];
+  }
+
+  /// 连麦名单快照是否可用于交叉校验（新鲜且 ≥2 人）
+  bool get _linkMembersFresh =>
+      _linkMembers.length >= 2 &&
+      DateTime.now().millisecondsSinceEpoch - _linkMembersAt < 90000;
+
   int _clockOffsetMs = 0;
 
   int get nowMs => DateTime.now().millisecondsSinceEpoch + _clockOffsetMs;
@@ -351,6 +409,22 @@ class DouyinPkTracker {
 
   /// 当前格子顺序（uid 列表，供日志核对映射）
   List<int> get debugOrder => List.of(_nOrder);
+
+  // ---- SYNCORDER 诊断：每包 user_scores/linked_users 的原始数组序 ----
+  // 目的：验证「首包数组序 = 进频道顺序 = 官方格子序」假设。
+  // 2026-09-15 实测：同连接内数组序会变（首包 [小珊妹,Kitty,千禧,柱子]，
+  // 后续全变 [柱子,小珊妹,Kitty,千禧]），首见序不可信，必须留原始证据。
+  int _syncSeq = 0;
+  List<int> _lastPacketF17 = const [];
+  List<int> _lastPacketF45 = const [];
+  bool _lastPacketBattleKnown = false;
+
+  /// 最近一包的序签名（变化时才记日志，由 danmaku 层调用）
+  String get debugSyncSignature {
+    final f17 = _lastPacketF17.join(',');
+    final f45 = _lastPacketF45.join(',');
+    return '#$_syncSeq bk=$_lastPacketBattleKnown f17=[$f17] f45=[$f45]';
+  }
 
   /// 设置放大（画中画）模式。来源：房间详情 enlarge_guest 标记（定时刷新）
   /// 或 EnlargeGuest 消息；仅在 2 人局生效（state.pipMode 会按人数门控）
@@ -595,6 +669,10 @@ class DouyinPkTracker {
     _nPunishSec = 0;
     _nActive = false;
     _nHasTeamScores = false;
+    _ringCycle.clear();
+    _ringStreak = 0;
+    _linkMembers.clear();
+    _linkMembersAt = 0;
   }
 
   void _emit() {
@@ -648,6 +726,7 @@ class DouyinPkTracker {
     int? id;
     int? start;
     int? dur;
+    final userEntries = <MapEntry<int, List<int>>>[];
 
     final r = PbReader(payload);
     r.forEachField((f, w) {
@@ -664,7 +743,8 @@ class DouyinPkTracker {
         }
         return true;
       }
-      // user_infos: map<int64, BattleUserInfo> —— 提供 teamId 与昵称
+      // user_infos: map<int64, BattleUserInfo> —— 提供 teamId 与昵称。
+      // 先收集后统一入库：需要先拿到 battleId 判断是否新战局
       if (f == 6 && w == 2) {
         final entry = PbReader(r.readBytes());
         var key = 0;
@@ -680,11 +760,47 @@ class DouyinPkTracker {
           }
           return false;
         });
-        if (value != null) _parseBattleUserInfo(key, value!);
+        if (value != null) userEntries.add(MapEntry(key, value!));
         return true;
       }
       return false;
     });
+
+    // 战局号变了 = 新战局：清上一局残留（旧协议结构只在退出房间时
+    // reset()，跨局累积会把上一局主播连人带分带进新一局）
+    if (id != null && id != 0 && id != _lastBattleId) {
+      _lastBattleId = id!;
+      _order.clear();
+      _latestScores.clear();
+      _teamMap.clear();
+      _profile.clear();
+      _ringCycle.clear();
+    _ringStreak = 0;
+      // 同步新协议战斗上下文，让 _battleFinished() 放行本局增量同步
+      //（否则旧 start 会让新局 syncs 全部被拒、旧人清不掉）
+      _nBattleIdStr = id!.toString();
+      _nStartMs = start ?? 0;
+      _nDurSec = dur ?? 0;
+      _nPhase = 0;
+    }
+
+    // user_infos 与最新连麦名单快照交叉校验：名单（≥2 人且新鲜）没有
+    // 的 uid 不入库。服务端会在新局 battle 消息里带上上一局对手
+    //（2026-09-15 春虫虫房实测），以连麦名单为权威剔除之
+    var entries = userEntries;
+    if (userEntries.isNotEmpty && _linkMembersFresh) {
+      final overlap =
+          userEntries.any((e) => _linkMembers.contains(e.key));
+      if (overlap) {
+        final kept = userEntries
+            .where((e) => _linkMembers.contains(e.key))
+            .toList();
+        if (kept.isNotEmpty) entries = kept;
+      }
+    }
+    for (final e in entries) {
+      _parseBattleUserInfo(e.key, e.value);
+    }
 
     // 末尾统一重建一次，此时 teamMap / profile 已就绪
     _rebuild(LivePkPhase.running, battleId: id, start: start, dur: dur);
@@ -827,6 +943,13 @@ class DouyinPkTracker {
       return false;
     });
 
+    // f19/f20 是秒（与 PK2-status 的 _nPunishSec 同约定），状态字段是
+    // 毫秒 —— 2026-09-15 实测：60 直接当 60ms 用，UI 的 pkOver 在
+    // finish 一到就成立 → 惩罚条闪没，~9s 后下一条 sync 用
+    // _nPunishSec*1000 才恢复成「PK结束 50s」。按量级归一成毫秒
+    if (punishDur > 0 && punishDur < 10000) punishDur *= 1000;
+    if (punishStart > 0 && punishStart < 100000000000) punishStart *= 1000;
+
     _state = LivePkState(
       battleId: prev?.battleId ?? 0,
       startTimeMs: prev?.startTimeMs ?? 0,
@@ -837,6 +960,10 @@ class DouyinPkTracker {
       topShowText: prev?.topShowText,
       punishDurationMs: punishDur,
       punishStartMs: punishStart,
+      // onFinish 之前漏带这两个字段：localUserId 归零会让 1v1 惩罚条
+      // 左右失序，hasScoreFlow 归零会在 durationMs 异常时误藏 PK 条
+      localUserId: prev?.localUserId ?? 0,
+      hasScoreFlow: prev?.hasScoreFlow ?? false,
     );
     _emit();
   }
@@ -1201,6 +1328,33 @@ class DouyinPkTracker {
       }
       return false;
     });
+    // SYNCORDER 捕获：在任何 early-return 之前记录本包原始数组序。
+    // scoreUids 保序（f17 数组序），syncOrder 保序（f45 linked_users 序）；
+    // bk=处理本包时战斗上下文是否已就位（battleId/start 任一已知）——
+    // 区分"开战起就在场收到的首包"与"中途进房才收到的包"
+    _syncSeq++;
+    _lastPacketF17 = List.of(scoreUids);
+    _lastPacketF45 = List.of(syncOrder);
+    _lastPacketBattleKnown =
+        (_nBattleIdStr != null && _nBattleIdStr!.isNotEmpty) || _nStartMs > 0;
+    // 环序捕获：user_scores 数组在多数战局里是同一循环的不同旋转起点
+    // （2026-09-16 8 人乱斗两局实测：网页版布局=环从本房读起，逐包旋转；
+    // 但 9 人乱斗实测逐包全 shuffle，无环）。因此逐包检测新包是否为
+    // 当前环的旋转：是→连续一致计数+1；不是→环重置为新包、计数归 1。
+    // 只有连续 ≥5 包一致（_ringStreak≥5）才允许布局使用环序，
+    // 乱序战局自动禁用，不会每包重排布局。
+    if (scoreUids.length >= 3) {
+      if (_ringCycle.isEmpty) {
+        _ringCycle = List.of(scoreUids);
+        _ringStreak = 1;
+      } else if (_isSameRingRotation(_ringCycle, scoreUids)) {
+        _ringStreak++;
+      } else if (scoreUids.length >= _ringCycle.length) {
+        _ringCycle = List.of(scoreUids);
+        _ringStreak = 1;
+      }
+      // 比当前环短的包（分片推送）不重置、不更新
+    }
     // 明确收到"只有连麦名单、无任何分数"：战局已退回纯连麦。
     // 但惩罚阶段（_nPhase==2）不清——主倒计时一结束服务端就停推分数，
     // 这条分支会在「PK 结束 (60s)」刚出现 1 秒时把人清光
@@ -1468,6 +1622,14 @@ class DouyinPkTracker {
         return;
       }
     }
+    // ≥2 人的名单 = 连麦成员快照（权威）：记录下来供 onBattle 的
+    // user_infos 交叉校验用（剔除服务端残留在新局消息里的上一局对手）
+    if (found.length >= 2) {
+      _linkMembers
+        ..clear()
+        ..addAll(found.keys);
+      _linkMembersAt = DateTime.now().millisecondsSinceEpoch;
+    }
     var changed = false;
     for (final e in found.entries) {
       if (!_nNames.containsKey(e.key) ||
@@ -1558,6 +1720,8 @@ class DouyinPkTracker {
     _nOrder.clear();
     _nLastSeen.clear();
     _nSawScores = false;
+    _ringCycle.clear();
+    _ringStreak = 0;
     _state = LivePkState(lastUpdateMs: DateTime.now().millisecondsSinceEpoch);
     _emit();
   }
@@ -1601,11 +1765,19 @@ class DouyinPkTracker {
         // 组队、以及 4/6 人乱斗：本房提到队头，其余保持加入序相对序。
         // 2026-09-14 4 人乱斗实测 3↔4：本房提前+行优先才对；
         // 若按 8 人那样旋转，本房前的人会被甩到队尾，右上/左下全错。
-        ids = [
-          _nLocalId,
-          for (final u in _nOrder)
-            if (u != _nLocalId) u,
-        ];
+        // 2026-09-16：环序对所有无座位战局启用（组队局与 8 人乱斗实测
+        // 均为旋转环，网页版布局=环从本房读起）；9 人乱斗等逐包乱序的
+        // 战局由 _ringStreak 门控自动禁用，退回首见序
+        final ring = _ringRotatedToLocal();
+        if (ring != null) {
+          ids = ring;
+        } else {
+          ids = [
+            _nLocalId,
+            for (final u in _nOrder)
+              if (u != _nLocalId) u,
+          ];
+        }
       } else {
         // 8 人乱斗：从本房在加入序中的位置转一圈（本房之前的人接到末尾）。
         // 2026-09-14 8 人乱斗实测：本房提前会把本房前的人留在第二格，

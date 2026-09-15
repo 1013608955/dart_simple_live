@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:simple_live_core/simple_live_core.dart';
@@ -44,6 +45,41 @@ class DouyinSite implements LiveSite {
   void _logElapsed(String label, Stopwatch stopwatch) {
     stopwatch.stop();
     _logDebug("$label 耗时 ${stopwatch.elapsedMilliseconds}ms");
+  }
+
+  /// PK 诊断：进房/刷新详情的连麦结构原始 JSON 落盘，用于挖掘每人
+  /// 格子位置/顺序字段（网页版"随时进都精准"的来源候选）。
+  /// 注意层级：enter 响应的 link_mic 在 data 顶层（不在 room 下）——
+  /// 上一版只查 room 层得到 null 是层级错误。去重 + 30s 限频。
+  static String? _lastDetailLinkMicDump;
+  static DateTime _lastDetailLinkMicDumpAt =
+      DateTime.fromMillisecondsSinceEpoch(0);
+  void _pkDumpDetailLinkMic(Map<String, Object?> fields) {
+    try {
+      final parts = <String>[];
+      for (final e in fields.entries) {
+        String raw;
+        try {
+          raw = e.value == null ? "null" : json.encode(e.value);
+        } catch (_) {
+          raw = "<unencodable>";
+        }
+        parts.add("${e.key}(${raw.length}B)=${raw.length > 2500 ? '${raw.substring(0, 2500)}...' : raw}");
+      }
+      final joined = parts.join(' || ');
+      final now = DateTime.now();
+      if (joined == _lastDetailLinkMicDump ||
+          now.difference(_lastDetailLinkMicDumpAt) < const Duration(seconds: 30)) {
+        return;
+      }
+      _lastDetailLinkMicDump = joined;
+      _lastDetailLinkMicDumpAt = now;
+      File('${Directory.systemTemp.path}/simple_live_pk_debug.log')
+          .writeAsStringSync(
+        "${DateTime.now().toIso8601String()} DETAIL-LINKMIC $joined\n",
+        mode: FileMode.append,
+      );
+    } catch (_) {}
   }
 
   Map<String, dynamic> _newRequestHeaders({
@@ -669,6 +705,14 @@ class DouyinSite implements LiveSite {
     var roomData = data["data"][0];
     var userData = data["user"];
     var roomId = roomData["id_str"].toString();
+    _pkDumpDetailLinkMic({
+      "dataKeys": data is Map ? data.keys.toList() : null,
+      "data.link_mic": data is Map ? data["link_mic"] : null,
+      "data.linker_map": data is Map ? data["linker_map"] : null,
+      "room.link_mic": roomData["link_mic"],
+      "room.linker_detail": roomData["linker_detail"],
+      "roomKeys": roomData is Map ? roomData.keys.toList() : null,
+    });
     final categoryInfo = _resolveDouyinCategoryInfo(roomData);
 
     // 读取用户唯一ID，用于弹幕连接
@@ -768,6 +812,13 @@ class DouyinSite implements LiveSite {
 
     var owner = room["owner"];
     var anchor = roomInfo["anchor"];
+    _pkDumpDetailLinkMic({
+      "relKeys": roomData.keys.toList(),
+      "room.link_mic": room["link_mic"],
+      "room.linker_map": room["linker_map"],
+      "room.linker_detail": room["linker_detail"],
+      "roomInfoKeys": roomInfo.keys.toList(),
+    });
     final categoryInfo = _resolveDouyinCategoryInfo(room);
     var roomStatus = (asT<int?>(room["status"]) ?? 0) == 2;
 
