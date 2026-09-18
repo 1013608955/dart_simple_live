@@ -67,6 +67,9 @@ class DouyinDanmaku implements LiveDanmaku {
   /// SEI 旁路放弃重连（URL 失效/流轮换）时回调，UI 层应换新 URL 重启
   void Function()? onSeiGiveUp;
 
+  /// SEI 旁路空闲断开标记（非连线流自动省带宽；WS 出现连麦/战局消息时唤醒）
+  bool _seiIdleClosed = false;
+
   /// PK 状态变化回调，由 UI 层注册
   Function(LivePkState state)? onPkState;
 
@@ -632,6 +635,8 @@ class DouyinDanmaku implements LiveDanmaku {
       if (_seenMethods.add(msg.method)) {
         _pkDebug("METHOD ${msg.method} payload=${msg.payload.length}B");
       }
+      // SEI 旁路空闲断开时，连麦/战局消息到达 = 活动恢复
+      _reviveSeiIfIdle(msg.method);
       if (msg.method == 'WebcastChatMessage') {
         final liveMessage = unPackWebcastChatMessage(msg.payload);
         if (liveMessage != null) {
@@ -925,6 +930,15 @@ class DouyinDanmaku implements LiveDanmaku {
     webScoketUtils?.close();
   }
 
+  /// 空闲断开后，WS 出现连麦/战局消息 = 连线活动恢复，唤醒旁路
+  void _reviveSeiIfIdle(String method) {
+    if (!_seiIdleClosed) return;
+    if (!method.contains('Link') && !method.contains('Battle')) return;
+    _pkDebug("SEI 空闲唤醒（$method）");
+    _seiIdleClosed = false;
+    _startSeiStream();
+  }
+
   /// 启动旁路 SEI 连接：拉同一 FLV 流解析连麦格位（app_data.grids）
   /// 与放大者（focus_id），喂给 pkTracker。flvUrl 缺失时静默跳过。
   /// 全程 try-catch——旁路任何失败都不影响弹幕/播放
@@ -955,6 +969,13 @@ class DouyinDanmaku implements LiveDanmaku {
         _pkDebug("SEI-EVENT give-up，请求上层刷新 URL");
         _seiStream = null;
         onSeiGiveUp?.call();
+      };
+      stream.onIdleClose = () {
+        // 非连线流（单人直播）自动省带宽：断开后 WS 出现连麦/战局
+        // 消息时由 _reviveSeiIfIdle 唤醒
+        _pkDebug("SEI 空闲断开（省带宽）");
+        _seiStream = null;
+        _seiIdleClosed = true;
       };
       _seiStream = stream;
       unawaited(stream.start(flvUrl));

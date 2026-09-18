@@ -1551,7 +1551,8 @@ class LiveRoomController extends PlayerController
         _pkDebugLog('SEI-REFRESH fail: 播放地址刷新失败（画质列表为空/已退房）');
         return;
       }
-      final flv = playUrls.firstWhere((u) => u.contains('.flv'), orElse: () => '');
+      // 优先最低档新地址（旧地址可能已过期，重新向服务端取）
+      final flv = await _pickSeiFlvUrl(fresh: true);
       if (flv.isEmpty) {
         _pkDebugLog('SEI-REFRESH fail: 新地址列表无 flv（HLS 线路），旁路保持停止');
         return;
@@ -1563,6 +1564,27 @@ class LiveRoomController extends PlayerController
     } catch (e) {
       _pkDebugLog('SEI-REFRESH exception: $e');
     }
+  }
+
+  /// SEI 旁路 URL 选择：优先最低清晰度档的 flv（app_data SEI 各转码档
+  /// 一致，实测 SD1 携带——2026-09-19 验证）。[fresh] 时重新向服务端
+  /// 取该档新地址（旧地址可能已过期）。
+  Future<String> _pickSeiFlvUrl({bool fresh = false}) async {
+    // 画质列表已按清晰度降序（index 0 最高），末位 = 最低档
+    if (qualites.value.isNotEmpty) {
+      final lowest = qualites.value.last;
+      var urls = lowest.data;
+      if (fresh) {
+        try {
+          urls = (await site.liveSite.getPlayUrls(
+                  detail: detail.value!, quality: lowest))
+              .urls;
+        } catch (_) {}
+      }
+      final f = urls.firstWhere((u) => u.contains('.flv'), orElse: () => '');
+      if (f.isNotEmpty) return f;
+    }
+    return playUrls.firstWhere((u) => u.contains('.flv'), orElse: () => '');
   }
 
   /// 抖音连麦名册拉取（失败静默；SEI 格位晚到时也能补建映射）
@@ -2024,8 +2046,11 @@ class LiveRoomController extends PlayerController
           'isDouyinDm=${danmaku is DouyinDanmaku} urls=${playUrl.urls.length} '
           'flvUrls=${isFlv.length} url0=${playUrl.urls.isEmpty ? "-" : playUrl.urls.first.substring(0, playUrl.urls.first.length.clamp(0, 80))}');
       if (site.id == Constant.kDouyin && danmaku is DouyinDanmaku) {
-        if (isFlv.isNotEmpty) {
-          danmaku.updateSeiFlvUrl(isFlv.first);
+        // 旁路优先最低档（app_data SEI 各转码档一致，实测 SD1 携带；
+        // 旁路只解析元数据，低档省 ~76% 带宽——2026-09-19 验证）
+        final seiUrl = await _pickSeiFlvUrl();
+        if (seiUrl.isNotEmpty) {
+          danmaku.updateSeiFlvUrl(seiUrl);
         }
       }
     } catch (_) {}

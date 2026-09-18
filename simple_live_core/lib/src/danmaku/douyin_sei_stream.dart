@@ -20,6 +20,9 @@ class DouyinSeiStream {
   HttpClientResponse? _response;
   StreamSubscription<List<int>>? _subscription;
   Timer? _retryTimer;
+  Timer? _idleTimer;
+  DateTime _lastDataAt = DateTime.now();
+  bool _idleClosed = false;
   bool _stopped = true;
   int _retryCount = 0;
 
@@ -41,13 +44,33 @@ class DouyinSeiStream {
   /// 重试上限用尽放弃（URL 失效/流已轮换），上层应换新 URL 后重新 start
   void Function()? onGiveUp;
 
+  /// 空闲自动断开回调：长时无 app_data = 无连线活动，带宽归零。
+  /// 上层在 WS 出现连麦/战局消息时重新 start 即可恢复
+  void Function()? onIdleClose;
+
   bool get running => !_stopped;
+
+  /// 空闲判定：最后一条 app_data 距今超过该时长即断开（单人直播的
+  /// 流里没有布局数据；连麦/PK 期间 ~2s 一条）
+  static const idleTimeout = Duration(minutes: 5);
 
   Future<void> start(String flvUrl, {Map<String, String>? requestHeaders}) async {
     url = flvUrl;
     headers = requestHeaders ?? const {};
     _stopped = false;
     _retryCount = 0;
+    _idleClosed = false;
+    _lastDataAt = DateTime.now();
+    _idleTimer?.cancel();
+    _idleTimer = Timer.periodic(const Duration(seconds: 60), (_) {
+      if (_stopped || _idleClosed) return;
+      if (DateTime.now().difference(_lastDataAt) > idleTimeout) {
+        _idleClosed = true;
+        onEvent?.call('idle-close（${idleTimeout.inMinutes}min 无 app_data，非连线流）');
+        unawaited(_closeTransport());
+        onIdleClose?.call();
+      }
+    });
     await _connect();
   }
 
@@ -73,6 +96,7 @@ class DouyinSeiStream {
           try {
             final layout = _parser.feed(chunk);
             if (layout != null) {
+              _lastDataAt = DateTime.now();
               onLayout?.call(layout);
             }
           } catch (_) {
@@ -125,6 +149,8 @@ class DouyinSeiStream {
     _stopped = true;
     _retryTimer?.cancel();
     _retryTimer = null;
+    _idleTimer?.cancel();
+    _idleTimer = null;
     await _closeTransport();
     _parser.reset();
   }
