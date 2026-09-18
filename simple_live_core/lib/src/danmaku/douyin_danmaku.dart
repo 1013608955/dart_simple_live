@@ -52,6 +52,7 @@ class DouyinDanmaku implements LiveDanmaku {
   Function()? onReady;
   String serverUrl = "wss://webcast3-ws-web-lq.douyin.com/webcast/im/push/v2/";
   late DouyinDanmakuArgs danmakuArgs;
+  bool _danmakuArgsReady = false; // 防止保留逻辑读到未初始化的 late 变量
   WebScoketUtils? webScoketUtils;
   final List<LiveMessage> _pendingChatMessages = <LiveMessage>[];
   Timer? _flushChatTimer;
@@ -325,7 +326,8 @@ class DouyinDanmaku implements LiveDanmaku {
     // 先于 start() 完成，其注入的 flvUrl 会被这里整体换 args 抹掉，
     // SEI 旁路永远起不来（2026-09-19 实测：重进房 INJECT 先完成、
     // start 随后把 flvUrl 抹空）。仅同房间保留；换房视为新流
-    if (danmakuArgs.flvUrl != null &&
+    if (_danmakuArgsReady &&
+        danmakuArgs.flvUrl != null &&
         (newArgs.flvUrl == null || newArgs.flvUrl!.isEmpty) &&
         danmakuArgs.webRid == newArgs.webRid &&
         danmakuArgs.roomId == newArgs.roomId) {
@@ -339,6 +341,7 @@ class DouyinDanmaku implements LiveDanmaku {
     } else {
       danmakuArgs = newArgs;
     }
+    _danmakuArgsReady = true;
     _contextRefreshUsed = false;
     // 本房 internalRoomId：linker_map 座位表里值等于它的条目即本房格
     final ownRoomId = int.tryParse(danmakuArgs.roomId);
