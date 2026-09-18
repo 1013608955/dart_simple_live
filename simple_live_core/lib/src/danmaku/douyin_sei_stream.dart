@@ -85,6 +85,7 @@ class DouyinSeiStream {
       _request = req;
       final resp = await req.close().timeout(const Duration(seconds: 15));
       if (resp.statusCode != 200) {
+        onEvent?.call('connect HTTP ${resp.statusCode}');
         await _closeTransport();
         _scheduleRetry();
         return;
@@ -107,7 +108,8 @@ class DouyinSeiStream {
         onDone: () => _scheduleRetry(),
         cancelOnError: true,
       );
-    } catch (_) {
+    } catch (e) {
+      onEvent?.call('connect error: ${e.toString().substring(0, e.toString().length.clamp(0, 80))}');
       await _closeTransport();
       _scheduleRetry();
     }

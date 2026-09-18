@@ -2057,6 +2057,7 @@ class LiveRoomController extends PlayerController
           seiUrl = await _pickSeiFlvUrl();
         }
         if (seiUrl.isNotEmpty) {
+          _pkDebugLog('SEI-PICK ${seiUrl.substring(0, seiUrl.length.clamp(0, 70))}');
           danmaku.updateSeiFlvUrl(seiUrl);
         } else {
           _pkDebugLog('SEI-INJECT 重试 3 次仍为空（HLS 线路/已退房），放弃');
