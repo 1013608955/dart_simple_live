@@ -325,6 +325,18 @@ class _Army {
 
 // ─────────────────────────── 状态跟踪器 ───────────────────────────
 
+/// 解析中文计数文本（"381"、"1.2万"、"3.5亿"）为整数；失败返回 null
+int? _parseCnCount(String s) {
+  s = s.trim();
+  if (s.isEmpty) return null;
+  final m = RegExp(r'^([\d.]+)\s*([万亿]?)\$').firstMatch(s);
+  if (m == null) return int.tryParse(s);
+  final base = double.tryParse(m.group(1)!) ?? 0;
+  final unit = m.group(2);
+  final mult = unit == '万' ? 10000 : (unit == '亿' ? 100000000 : 1);
+  return (base * mult).round();
+}
+
 class DouyinPkTracker {
   LivePkState? _state;
   LivePkState? get state => _state;
@@ -420,6 +432,9 @@ class DouyinPkTracker {
   int get debugNameCount => _nNames.length;
   int get debugOrderCount => _nOrder.length;
   int get debugProfileCount => _profile.length;
+
+  /// 诊断：当前累计分（STATE 日志用）
+  Map<int, int> get debugScores => Map.of(_nTotals);
 
   /// 当前格子顺序（uid 列表，供日志核对映射）
   List<int> get debugOrder => List.of(_nOrder);
@@ -1427,10 +1442,14 @@ class DouyinPkTracker {
 
   /// WebcastLinkMicMethod：总分同步（含队伍分）
   void onLinkMicMethod(List<int> payload) {
-    // 战局已结束后服务端仍会推送带旧分数的同步消息——忽略，
-    // 否则清掉的徽章会被重新加回
-    if (_battleFinished()) return;
+    // 战局已结束后服务端仍会推送带旧分数的同步消息——纯"已结束且连线
+    // 已退出"才忽略。连线存活（名册 90s 内新鲜 / SEI 座位生效）时必须
+    // 继续解析：普通连线的礼物分（f17）就靠这些同步维持
+    //（2026-09-19 实测：PK 后回连线，过期 start/dur 让守卫把 f17 全拒，
+    // 礼物分永远 0 而网页正常显示）
+    if (_battleFinished() && !_linkMembersFresh && !_seiSeatReady) return;
     int? score;
+    String? scoreStr;
     int? uid;
     int? teamScore;
     int? rank;
@@ -1476,6 +1495,13 @@ class DouyinPkTracker {
             uid = s.readVarint();
             return true;
           }
+          if (sf == 7 && sw == 2) {
+            // 分数字符串（部分房间/大分值时 f1 缺席只发此字段）
+            try {
+              scoreStr = s.readString();
+            } catch (_) {}
+            return true;
+          }
           if (sf == 8 && sw == 0) {
             rank = s.readVarint();
             return true;
@@ -1502,7 +1528,7 @@ class DouyinPkTracker {
           // uid 出现在 user_scores 即为参与者。field 1（个人分）为 0 时
           // protobuf 省略字段（sc==null），必须写入 0——否则 0 分主播会从
           // 参与者列表消失（2026-09-12 实测 4 人房只出 3 格）
-          _nTotals[u] = sc ?? 0;
+          _nTotals[u] = sc ?? _parseCnCount(scoreStr ?? '') ?? 0;
           if (rk != null && rk != 0) _nRank[u] = rk!;
           if (ts != null && ts != 0) {
             _nTeamScore[u] = ts;

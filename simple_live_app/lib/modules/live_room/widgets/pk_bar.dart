@@ -274,7 +274,7 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
           // 人数角标垂直位置：默认窗口贴近顶行（用户口径 2026-09-19
           // 「往上靠一点」）；全屏放大后下移避开右上角悬停按钮区
           final badgeTop = rect.top +
-              (scale >= 1.4 ? 54 : 10) * scale;
+              (c.maxHeight > 800 ? 54 : 10) * scale;
 
           return Stack(
             children: [
