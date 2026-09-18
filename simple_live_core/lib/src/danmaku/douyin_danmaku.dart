@@ -130,6 +130,9 @@ class DouyinDanmaku implements LiveDanmaku {
   /// 旧文件改名为 .1（覆盖更早一份），最多 2 份共 16MB，
   /// 防长时间观看把 TEMP 撑爆（2026-09-14 实测单文件 150MB+）。
   /// 任何异常都吞掉，绝不影响播放
+  /// 外部诊断写入 pk 日志（供 controller 转发 tracker 内部事件）
+  void debugPkLog(String line) => _pkDebug(line);
+
   void _pkDebug(String line) {
     try {
       _pkLogFile ??= File('${Directory.systemTemp.path}/simple_live_pk_debug.log');

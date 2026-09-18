@@ -719,6 +719,7 @@ class DouyinPkTracker {
     _lastSeiLayout = null;
     _lastSeiLayoutAtMs = 0;
     _battleStartById.clear();
+    _battleHadTeamIds = false;
   }
 
   void _emit() {
@@ -839,6 +840,25 @@ class DouyinPkTracker {
     // 的 uid 不入库。服务端会在新局 battle 消息里带上上一局对手
     //（2026-09-15 春虫虫房实测），以连麦名单为权威剔除之
     var entries = userEntries;
+    // 队伍解散检测：本条 battle 消息的 user_infos 全员无 multi_pk_team_id
+    // 且上一条有 → 队伍被解散（2026-09-19 实测：团队 PK 战斗中降级为
+    // 个人战）→ 清队伍条标志，回退乱斗显示（徽章保留）
+    var anyTeamId = false;
+    if (userEntries.isNotEmpty) {
+      for (final e in userEntries) {
+        if (_parseBattleUserInfo(e.key, e.value)) {
+          anyTeamId = true;
+          break;
+        }
+      }
+      if (!anyTeamId && _battleHadTeamIds) {
+        _nHasTeamScores = false;
+        _battleHadTeamIds = false;
+        pkDebugInternal?.call('PK 队伍解散：user_infos 无 multi_pk_team_id，回退乱斗显示');
+      } else if (anyTeamId) {
+        _battleHadTeamIds = true;
+      }
+    }
     if (userEntries.isNotEmpty && _linkMembersFresh) {
       final overlap =
           userEntries.any((e) => _linkMembers.contains(e.key));
@@ -858,11 +878,14 @@ class DouyinPkTracker {
     _emit();
   }
 
-  void _parseBattleUserInfo(int mapKey, List<int> bytes) {
+  /// 解析 BattleUserInfo。返回该条目是否携带 multi_pk_team_id（队伍
+  /// 结构存在性信号：全员缺失 = 队伍已解散，2026-09-19 实测）
+  bool _parseBattleUserInfo(int mapKey, List<int> bytes) {
     var userId = mapKey;
     var teamId = 0;
     var nickname = '';
     String? avatar;
+    var hasTeamId = false;
 
     final r = PbReader(bytes);
     r.forEachField((f, w) {
@@ -887,12 +910,13 @@ class DouyinPkTracker {
       }
       if (f == 10 && w == 0) {
         teamId = r.readVarint();
+        hasTeamId = true;
         return true;
       }
       return false;
     });
 
-    if (userId == 0) return;
+    if (userId == 0) return false;
     _teamMap[userId] = teamId;
     final old = _profile[userId];
     _profile[userId] = _Army(
@@ -902,6 +926,7 @@ class DouyinPkTracker {
       avatar: avatar ?? old?.avatar,
     );
     if (!_order.contains(userId)) _order.add(userId);
+    return hasTeamId;
   }
 
   /// WebcastLinkMicArmiesMethod → LinkMicArmies：PK 分数实时更新
@@ -1311,6 +1336,12 @@ class DouyinPkTracker {
 
   /// battleId → start 登记（车轮战换场后识别"旧局状态迟到重播"并丢弃）
   final Map<String, int> _battleStartById = <String, int>{};
+
+  /// 上一条 battle 消息的 user_infos 是否携带 multi_pk_team_id
+  bool _battleHadTeamIds = false;
+
+  /// 内部诊断回调（STATE 日志用）
+  void Function(String msg)? pkDebugInternal;
   bool _nActive = false;
 
   /// 回退格子顺序：本房优先（位于 0 号格）；其余按名次升序

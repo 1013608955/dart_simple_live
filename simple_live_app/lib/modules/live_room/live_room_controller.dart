@@ -1519,6 +1519,8 @@ class LiveRoomController extends PlayerController
       dm.pkTracker.setLocalNicknameHint(detail.value?.userName ?? '');
       // 放大（画中画）状态随详情加载注入
       dm.pkTracker.setPipMode(detail.value?.enlargeGuest ?? false);
+      // tracker 内部事件（队伍解散等）转发到 pk 日志
+      dm.pkTracker.pkDebugInternal = (msg) => dm.debugPkLog(msg);
       // 连麦名册（HTTP /webcast/linkmic/list/，网页版身份桥）：
       // 进房拉一次补齐 linkmic_id↔uid 映射，SEI 座位在所有房间生效
       unawaited(_fetchLinkmicRoster(dm));
