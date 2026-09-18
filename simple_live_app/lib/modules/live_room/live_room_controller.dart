@@ -2048,9 +2048,18 @@ class LiveRoomController extends PlayerController
       if (site.id == Constant.kDouyin && danmaku is DouyinDanmaku) {
         // 旁路优先最低档（app_data SEI 各转码档一致，实测 SD1 携带；
         // 旁路只解析元数据，低档省 ~76% 带宽——2026-09-19 验证）
-        final seiUrl = await _pickSeiFlvUrl();
+        var seiUrl = await _pickSeiFlvUrl();
+        // 快速切房竞态：pick 的 await 间隙里 playUrls 可能被新房间
+        // 清空导致拿到空值——5s 间隔重试最多 3 次（退房即停）
+        for (var attempt = 0; attempt < 3 && seiUrl.isEmpty; attempt++) {
+          await Future.delayed(const Duration(seconds: 5));
+          if (_roomDisposed) return false;
+          seiUrl = await _pickSeiFlvUrl();
+        }
         if (seiUrl.isNotEmpty) {
           danmaku.updateSeiFlvUrl(seiUrl);
+        } else {
+          _pkDebugLog('SEI-INJECT 重试 3 次仍为空（HLS 线路/已退房），放弃');
         }
       }
     } catch (_) {}
