@@ -320,7 +320,25 @@ class DouyinDanmaku implements LiveDanmaku {
   @override
   Future start(dynamic args) async {
     final startStopwatch = Stopwatch()..start();
-    danmakuArgs = args as DouyinDanmakuArgs;
+    final newArgs = args as DouyinDanmakuArgs;
+    // 保留上一轮注入的旁路地址：画质/线路解析（_reloadPlayUrls）可能
+    // 先于 start() 完成，其注入的 flvUrl 会被这里整体换 args 抹掉，
+    // SEI 旁路永远起不来（2026-09-19 实测：重进房 INJECT 先完成、
+    // start 随后把 flvUrl 抹空）。仅同房间保留；换房视为新流
+    if (danmakuArgs.flvUrl != null &&
+        (newArgs.flvUrl == null || newArgs.flvUrl!.isEmpty) &&
+        danmakuArgs.webRid == newArgs.webRid &&
+        danmakuArgs.roomId == newArgs.roomId) {
+      danmakuArgs = DouyinDanmakuArgs(
+        webRid: newArgs.webRid,
+        roomId: newArgs.roomId,
+        userId: newArgs.userId,
+        cookie: newArgs.cookie,
+        flvUrl: danmakuArgs.flvUrl,
+      );
+    } else {
+      danmakuArgs = newArgs;
+    }
     _contextRefreshUsed = false;
     // 本房 internalRoomId：linker_map 座位表里值等于它的条目即本房格
     final ownRoomId = int.tryParse(danmakuArgs.roomId);
