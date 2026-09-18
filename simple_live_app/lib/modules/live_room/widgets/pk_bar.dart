@@ -271,7 +271,9 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
           );
           // 人数角标与标题同一行（用户口径 2026-09-13：右上角对齐标题），
           // PK 条/倒计时在下一行不与角标重叠
-          final badgeTop = rect.top + 8 * scale;
+          // 人数角标下移 46*scale：右上角是播放器悬停按钮区（鼠标一动
+          // 就出现），原 8*scale 顶行会与之重叠（2026-09-19 全屏实测）
+          final badgeTop = rect.top + 54 * scale;
 
           return Stack(
             children: [
@@ -1213,9 +1215,14 @@ class DouyinPkGridOverlay extends StatelessWidget {
                   : null,
               child: _PkCellBadge(
                 side: cell.side,
-                showScore: (showScoresInBattle ||
-                        (!hasBattle && cell.side.score > 0)) &&
-                    !pkOver,
+                // 分数药丸：PK 中显示战局分；普通连线/PK 结束后显示礼物
+                // 分（网页版同款常驻，含 0）。不挂 !pkOver——PK 结束后
+                // 过期 battleEnd 会让 pkOver 永真，把连线礼物分永久压住
+                //（2026-09-19 实测：PK 后回到连线，网页有 78/6810 等礼物
+                // 分而客户端全无）
+                showScore: showScoresInBattle ||
+                    (!hasBattle &&
+                        (cell.side.score > 0 || state.hasScoreFlow)),
                 scale: scale * cellBadgeScale(cell),
                 nameScale: nameScale,
                 // 乱斗局（无队伍分）用金冠/灰底蓝圈徽章，不用队色。
