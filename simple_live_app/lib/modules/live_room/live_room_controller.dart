@@ -226,6 +226,7 @@ class LiveRoomController extends PlayerController
   Timer? _superChatRefreshTimer;
   Timer? _chatBottomRestoreTimer;
   Timer? _onlineRefreshTimer;
+  Timer? _rosterRefreshTimer;
   Timer? _memoryCleanupTimer; // 内存清理定时器
   bool _onlineRefreshInFlight = false;
   final LiveStatusRefreshPolicy _onlineStatusRefreshPolicy =
@@ -1398,6 +1399,8 @@ class LiveRoomController extends PlayerController
   @override
   void onClose() async {
     _roomDisposed = true;
+    _rosterRefreshTimer?.cancel();
+    _rosterRefreshTimer = null;
     clearTransientPlayerOverlays();
     _loadGeneration += 1;
     WidgetsBinding.instance.removeObserver(this);
@@ -1519,6 +1522,18 @@ class LiveRoomController extends PlayerController
       // 连麦名册（HTTP /webcast/linkmic/list/，网页版身份桥）：
       // 进房拉一次补齐 linkmic_id↔uid 映射，SEI 座位在所有房间生效
       unawaited(_fetchLinkmicRoster(dm));
+      // 周期刷新：中途加入的成员不在进房名册里（映射/昵称双缺，
+      // 徽章会缺失），120s 补拉一次直到退房
+      _rosterRefreshTimer?.cancel();
+      _rosterRefreshTimer =
+          Timer.periodic(const Duration(seconds: 120), (_) {
+        if (!_roomDisposed && liveDanmaku == dm) {
+          unawaited(_fetchLinkmicRoster(dm));
+        } else {
+          _rosterRefreshTimer?.cancel();
+          _rosterRefreshTimer = null;
+        }
+      });
       // SEI 旁路 URL 失效（PK 结束流轮换等）：重新解析播放地址并重启旁路
       dm.onSeiGiveUp = () {
         unawaited(_refreshSeiUrl());
@@ -1532,18 +1547,28 @@ class LiveRoomController extends PlayerController
   /// 换新 URL 重启旁路。失败静默（下一局进房会重建）
   Future<void> _refreshSeiUrl() async {
     try {
-      if (!await _reloadPlayUrls(silent: true)) return;
+      if (!await _reloadPlayUrls(silent: true)) {
+        _pkDebugLog('SEI-REFRESH fail: 播放地址刷新失败（画质列表为空/已退房）');
+        return;
+      }
       final flv = playUrls.firstWhere((u) => u.contains('.flv'), orElse: () => '');
-      if (flv.isNotEmpty && liveDanmaku is DouyinDanmaku) {
+      if (flv.isEmpty) {
+        _pkDebugLog('SEI-REFRESH fail: 新地址列表无 flv（HLS 线路），旁路保持停止');
+        return;
+      }
+      if (liveDanmaku is DouyinDanmaku) {
         _pkDebugLog('SEI-REFRESH url=${flv.substring(0, flv.length.clamp(0, 60))}');
         (liveDanmaku as DouyinDanmaku).updateSeiFlvUrl(flv);
       }
-    } catch (_) {}
+    } catch (e) {
+      _pkDebugLog('SEI-REFRESH exception: $e');
+    }
   }
 
   /// 抖音连麦名册拉取（失败静默；SEI 格位晚到时也能补建映射）
   Future<void> _fetchLinkmicRoster(DouyinDanmaku dm) async {
     try {
+      if (_roomDisposed) return;
       final d = detail.value;
       final ls = site.liveSite;
       if (d == null || ls is! DouyinSite) return;

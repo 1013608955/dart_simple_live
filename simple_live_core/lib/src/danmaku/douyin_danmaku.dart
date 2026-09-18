@@ -150,24 +150,36 @@ class DouyinDanmaku implements LiveDanmaku {
   }
 
   void _onPkUpdate(LivePkState s) {
-    _pkDebug(
-      "STATE count=${s.count} teams=${s.teamScores} "
-      "rawTeam=${pkTracker.debugRawTeamScores} ranks=${pkTracker.debugRanks} "
-      "order=${pkTracker.debugOrder} local=${s.localUserId} "
-      "seat=${pkTracker.debugSeatOrder} uiSeat=${pkTracker.debugUiSeat} nickHint=${pkTracker.debugLocalNickHint} "
-      "nicks=${s.participants.map((p) => '${p.userId}:${p.nickname}').join('|')} "
-      "pip=${s.pipMode} big=${s.bigMode} enl=${s.enlargedUserId} "
-      "seatRoom=${pkTracker.debugSeatRoom} "
-      "roomRes=${pkTracker.debugRoomResolvedCount}/${pkTracker.debugSeatRoom.length} "
-      "hasScores=${s.hasScores} phase=${s.phase} battleId=${s.battleId} "
-      "start=${pkTracker.debugStartMs} dur=${pkTracker.debugDurSec}s punish=${pkTracker.debugPunishSec}s clockOffset=${pkTracker.debugClockOffsetMs}ms"
-      "names=${pkTracker.debugNameCount} profile=${pkTracker.debugProfileCount} "
-      "sei=${pkTracker.debugSeiState}",
-    );
+    // STATE 日志节流：礼物高峰每次上分都触发（实测 931 条/5 分钟），
+    // 同步文件 IO 太密——1 秒最多一条；人数/阶段/放大变化立即放行
+    final stateKey =
+        '${s.count}|${s.phase}|${s.enlargedUserId}|${s.battleId}';
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (stateKey != _lastStateLogKey || now - _lastStateLogAt >= 1000) {
+      _lastStateLogKey = stateKey;
+      _lastStateLogAt = now;
+      _pkDebug(
+        "STATE count=${s.count} teams=${s.teamScores} "
+        "rawTeam=${pkTracker.debugRawTeamScores} ranks=${pkTracker.debugRanks} "
+        "order=${pkTracker.debugOrder} local=${s.localUserId} "
+        "seat=${pkTracker.debugSeatOrder} uiSeat=${pkTracker.debugUiSeat} nickHint=${pkTracker.debugLocalNickHint} "
+        "nicks=${s.participants.map((p) => '${p.userId}:${p.nickname}').join('|')} "
+        "pip=${s.pipMode} big=${s.bigMode} enl=${s.enlargedUserId} "
+        "seatRoom=${pkTracker.debugSeatRoom} "
+        "roomRes=${pkTracker.debugRoomResolvedCount}/${pkTracker.debugSeatRoom.length} "
+        "hasScores=${s.hasScores} phase=${s.phase} battleId=${s.battleId} "
+        "start=${pkTracker.debugStartMs} dur=${pkTracker.debugDurSec}s punish=${pkTracker.debugPunishSec}s clockOffset=${pkTracker.debugClockOffsetMs}ms"
+        "names=${pkTracker.debugNameCount} profile=${pkTracker.debugProfileCount} "
+        "sei=${pkTracker.debugSeiState}",
+      );
+    }
     onPkState?.call(s);
     _maybeFetchNicknames(s);
     _maybeResolveSeatRooms();
   }
+
+  String _lastStateLogKey = '';
+  int _lastStateLogAt = 0;
 
   // ---- 对手昵称 HTTP 查询（WS 消息不含昵称，房间详情只有本房名） ----
   // 每个房间实例每个 uid 只查一次（含失败）；单轮最多查 3 个，防风控

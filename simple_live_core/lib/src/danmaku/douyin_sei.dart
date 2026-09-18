@@ -92,6 +92,9 @@ class DouyinSeiParser {
   bool _headerSkipped = false;
   int _seiCount = 0;
 
+  /// 垃圾流防护上限：非 FLV 数据永远切不出 tag，超限丢弃重来
+  static const int _maxBuffer = 8 << 20; // 8MB
+
   int get seiCount => _seiCount;
 
   /// 当前已解析的最新布局（无变化时返回同一引用）
@@ -101,6 +104,13 @@ class DouyinSeiParser {
   /// 返回本次新解析出的布局（可能为 null）。
   SeiLayout? feed(List<int> bytes) {
     _buf.addAll(bytes);
+    // 防护：接到非 FLV 流（错误页/HTML/HLS 误接）时 tag 永远切不出来，
+    // 缓冲会无限增长——超限直接丢弃（旁路解析可牺牲，内存不可失控）
+    if (_buf.length > _maxBuffer || _pending.length > _maxBuffer) {
+      _buf.clear();
+      _pending.clear();
+      _headerSkipped = false;
+    }
     if (!_headerSkipped) {
       if (_buf.length < 13) return null;
       // FLV header: 'FLV' + version + flags + headerSize(4B)，随后 4B PreviousTagSize0
