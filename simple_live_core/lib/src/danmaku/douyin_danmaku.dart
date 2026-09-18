@@ -6,6 +6,7 @@ import 'package:simple_live_core/src/common/http_client.dart';
 import 'package:simple_live_core/src/common/web_socket_util.dart';
 import 'package:simple_live_core/src/danmaku/douyin_emoji_assets.dart';
 import 'package:simple_live_core/src/danmaku/douyin_pk.dart';
+import 'package:simple_live_core/src/danmaku/douyin_sei_stream.dart';
 import 'package:simple_live_core/src/scripts/douyin_sign.dart';
 
 import 'proto/douyin.pb.dart';
@@ -15,11 +16,17 @@ class DouyinDanmakuArgs {
   final String roomId;
   final String userId;
   final String cookie;
+
+  /// 旁路 SEI 连接用的 FLV 地址（可选，UI 层从画质列表注入）。
+  /// 用于解析连麦格位（app_data.grids）与放大者（focus_id），
+  /// 为空则跳过 SEI 解析（回退环序/座位表）
+  final String? flvUrl;
   DouyinDanmakuArgs({
     required this.webRid,
     required this.roomId,
     required this.userId,
     required this.cookie,
+    this.flvUrl,
   });
   @override
   String toString() {
@@ -28,6 +35,7 @@ class DouyinDanmakuArgs {
       "roomId": roomId,
       "userId": userId,
       "cookie": cookie,
+      "flvUrl": flvUrl,
     });
   }
 }
@@ -52,6 +60,12 @@ class DouyinDanmaku implements LiveDanmaku {
 
   /// 抖音 PK 分数跟踪器（PK 条只在 PK 期间有值）
   final DouyinPkTracker pkTracker = DouyinPkTracker();
+
+  /// 旁路 SEI 连接（拉同一 FLV 解析格位/放大者；播放用 mpv 自己的连接）
+  DouyinSeiStream? _seiStream;
+
+  /// SEI 旁路放弃重连（URL 失效/流轮换）时回调，UI 层应换新 URL 重启
+  void Function()? onSeiGiveUp;
 
   /// PK 状态变化回调，由 UI 层注册
   Function(LivePkState state)? onPkState;
@@ -147,7 +161,8 @@ class DouyinDanmaku implements LiveDanmaku {
       "roomRes=${pkTracker.debugRoomResolvedCount}/${pkTracker.debugSeatRoom.length} "
       "hasScores=${s.hasScores} phase=${s.phase} battleId=${s.battleId} "
       "start=${pkTracker.debugStartMs} dur=${pkTracker.debugDurSec}s punish=${pkTracker.debugPunishSec}s clockOffset=${pkTracker.debugClockOffsetMs}ms"
-      "names=${pkTracker.debugNameCount} profile=${pkTracker.debugProfileCount}",
+      "names=${pkTracker.debugNameCount} profile=${pkTracker.debugProfileCount} "
+      "sei=${pkTracker.debugSeiState}",
     );
     onPkState?.call(s);
     _maybeFetchNicknames(s);
@@ -302,6 +317,7 @@ class DouyinDanmaku implements LiveDanmaku {
       CoreLog.w("[DouyinDanmaku] 动态弹幕上下文获取失败，使用兼容地址：$e");
     }
     _openWebSocket(args);
+    _startSeiStream();
     startStopwatch.stop();
     CoreLog.i(
       "[DouyinDanmaku] start(${danmakuArgs.webRid}) 耗时 ${startStopwatch.elapsedMilliseconds}ms",
@@ -892,7 +908,76 @@ class DouyinDanmaku implements LiveDanmaku {
     // PK 状态同步清理，避免下个房间残留旧比分
     onPkState = null;
     pkTracker.reset();
+    await _stopSeiStream();
     webScoketUtils?.close();
+  }
+
+  /// 启动旁路 SEI 连接：拉同一 FLV 流解析连麦格位（app_data.grids）
+  /// 与放大者（focus_id），喂给 pkTracker。flvUrl 缺失时静默跳过。
+  /// 全程 try-catch——旁路任何失败都不影响弹幕/播放
+  void _startSeiStream() {
+    final flvUrl = danmakuArgs.flvUrl;
+    if (flvUrl == null || flvUrl.isEmpty) {
+      _pkDebug("SEI 旁路未启动：flvUrl 为空（画质列表未含 flv）");
+      return;
+    }
+    // 先停旧连接：换房/换清晰度时旧流的 in-flight 回调会把上一个
+    // 房间的布局写进当前 tracker（2026-09-18 实测 3/8 格交叉污染）
+    unawaited(_stopSeiStream());
+    try {
+      final stream = DouyinSeiStream();
+      stream.onLayout = (layout) {
+        if (_seiStream != stream) return; // 已被更新的连接顶替
+        try {
+          pkTracker.applySeiLayout(layout);
+          _pkDebug(
+              "SEI-LAYOUT ver=${layout.ver} grids=${layout.grids.length} "
+              "focus=${layout.focusLinkmicId.isEmpty ? '-' : layout.focusLinkmicId}");
+        } catch (_) {}
+      };
+      stream.onEvent = (msg) => _pkDebug("SEI-EVENT $msg");
+      stream.onGiveUp = () {
+        // 流轮换（PK 结束/清晰度切换）导致 URL 失效：丢弃死连接并
+        // 通知上层换新 URL（controller 重新解析播放地址后回调）
+        _pkDebug("SEI-EVENT give-up，请求上层刷新 URL");
+        _seiStream = null;
+        onSeiGiveUp?.call();
+      };
+      _seiStream = stream;
+      unawaited(stream.start(flvUrl));
+      _pkDebug("SEI 旁路已启动 flv=${flvUrl.substring(0, flvUrl.length.clamp(0, 60))}");
+      CoreLog.i("[DouyinDanmaku] SEI 旁路已启动");
+    } catch (e) {
+      _pkDebug("SEI 旁路启动异常：$e");
+      CoreLog.w("[DouyinDanmaku] SEI 旁路启动失败（忽略）：$e");
+    }
+  }
+
+  Future<void> _stopSeiStream() async {
+    final stream = _seiStream;
+    _seiStream = null;
+    if (stream != null) {
+      try {
+        await stream.stop();
+      } catch (_) {}
+    }
+  }
+
+  /// 播放地址解析完成后由 UI 层注入（弹幕通常先于画质列表启动）：
+  /// 更新 args 并补启动旁路；换 URL（切画质/线路）时重启连接
+  void updateSeiFlvUrl(String flvUrl) {
+    try {
+      if (danmakuArgs.flvUrl == flvUrl && _seiStream != null) return;
+      danmakuArgs = DouyinDanmakuArgs(
+        webRid: danmakuArgs.webRid,
+        roomId: danmakuArgs.roomId,
+        userId: danmakuArgs.userId,
+        cookie: danmakuArgs.cookie,
+        flvUrl: flvUrl,
+      );
+      unawaited(_stopSeiStream());
+      _startSeiStream();
+    } catch (_) {}
   }
 }
 

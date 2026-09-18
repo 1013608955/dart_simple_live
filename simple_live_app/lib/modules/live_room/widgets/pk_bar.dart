@@ -47,6 +47,12 @@ class DouyinPkLayer extends StatefulWidget {
   /// PK 期间下移避让进度条，与观看人数角标同排
   final String title;
 
+  /// 是否显示直播间标题（默认 true）。关闭后标题不渲染，PK 条仍显示。
+  final bool showTitle;
+
+  /// 是否显示观看人数角标（默认 true）。关闭后角标不渲染，PK 条仍显示。
+  final bool showViewerCount;
+
   /// 手动交换回调（uidA, uidB）：交换模式下点选两个格子后触发，
   /// 由外部转发到 pkTracker.registerManualSwap
   final void Function(int uidA, int uidB)? onManualSwap;
@@ -60,6 +66,8 @@ class DouyinPkLayer extends StatefulWidget {
     this.viewerCount,
     this.localNickname = '',
     this.title = '',
+    this.showTitle = true,
+    this.showViewerCount = true,
     this.onManualSwap,
   });
 
@@ -154,12 +162,16 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
       // 进行中没人上分、以及「PK 结束 60s」窗口内服务端停推分数，
       // 都不能因超时把条/分值搞没（用户口径 2026-09-14）
       final stale = s != null && s.count <= 1;
+      // SEI 精确几何可用：参与者带 seatX/Y/W/H（画布相对坐标）
+      final seiGeometry =
+          s != null && s.participants.any((p) => p.seatX != null);
       final pkOver = s != null &&
           ((battleEndAtMs > 0 && nowMs >= battleEndAtMs + punishDurMs) ||
               stale);
       if (s == null || s.count == 0) {
         // 无 PK 数据：只剩标题与人数角标
-        if (viewers <= 0 && widget.title.isEmpty) {
+        if ((widget.title.isEmpty || !widget.showTitle) &&
+            (viewers <= 0 || !widget.showViewerCount)) {
           return const SizedBox.shrink();
         }
         return LayoutBuilder(
@@ -168,7 +180,7 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                 (c.maxWidth / 900).clamp(1.0, 2.2);
             return Stack(
               children: [
-                if (widget.title.isNotEmpty)
+                if (widget.title.isNotEmpty && widget.showTitle)
                   Positioned(
                     top: 8 * scale,
                     left: 0,
@@ -199,7 +211,7 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                       ),
                     ),
                   ),
-                if (viewers > 0)
+                if (viewers > 0 && widget.showViewerCount)
                   Positioned(
                     // 与标题同一行，右上角对齐
                     top: 8 * scale,
@@ -234,7 +246,7 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
           final scale = (rect.width / 900).clamp(1.0, 2.2);
           // 标题/条/角标贴窗口顶部（黑边上，用户口径 2026-09-13）：
           // 不随视频黑边移动，视频内不出现标题。徽章仍贴视频格子。
-          final hasTitle = widget.title.isNotEmpty;
+          final hasTitle = widget.title.isNotEmpty && widget.showTitle;
           final barTop = rect.top + 8 * scale + (hasTitle ? 30 * scale : 0);
           // 人数角标与标题同一行（用户口径 2026-09-13：右上角对齐标题），
           // PK 条/倒计时在下一行不与角标重叠
@@ -309,25 +321,35 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
               if (s.count >= 2 && !stale)
                 Positioned(
                   left: rect.left,
+                  // SEI 几何（seatX 等有值）：坐标是画布相对（0~1 对应完整
+                  // 1080x1920 合成画布），覆盖层必须铺满完整视频 rect 1:1
+                  // 映射。旧 0.1875/0.50 带状偏移只适用于无 SEI 的模板
+                  // 兜底（截图模板时代：格子带 = 画布 y 18.75%~68.75%）
                   top: rect.top +
-                      rect.height *
-                          (s.count == 2
-                              ? 0
-                              : (s.bigMode ? 0 : 0.1875)),
+                      (seiGeometry
+                          ? 0
+                          : rect.height *
+                              (s.count == 2
+                                  ? 0
+                                  : (s.bigMode ? 0 : 0.1875))),
                   width: rect.width,
-                  height: rect.height *
-                      (s.count == 2
-                          ? 0.60
-                          : (s.bigMode ? 1.0 : 0.50)),
+                  height: seiGeometry
+                      ? rect.height
+                      : rect.height *
+                          (s.count == 2
+                              ? 0.60
+                              : (s.bigMode ? 1.0 : 0.50)),
                   child: IgnorePointer(
                     ignoring: !_swapMode,
                     child: DouyinPkGridOverlay(
                       state: s,
                       width: rect.width,
-                      height: rect.height *
-                          (s.count == 2
-                              ? 0.60
-                              : (s.bigMode ? 1.0 : 0.50)),
+                      height: seiGeometry
+                          ? rect.height
+                          : rect.height *
+                              (s.count == 2
+                                  ? 0.60
+                                  : (s.bigMode ? 1.0 : 0.50)),
                       hasBattle: hasBattle,
                       pkOver: pkOver,
                       scale: scale,
@@ -391,7 +413,7 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                   ),
                 ),
               // 右上角：实时观看人数（标题存在时与标题同排，人数靠右）
-              if (viewers > 0)
+              if (viewers > 0 && widget.showViewerCount)
                 Positioned(
                   top: badgeTop,
                   left: 0,
@@ -526,12 +548,21 @@ class DouyinPkBar extends StatelessWidget {
                       ),
                       alignment: Alignment.centerLeft,
                       padding: EdgeInsets.only(left: 10 * ds),
-                      child: Text(
-                        '$leftScore',
-                        style: TextStyle(
-                          color: const Color(0xFF8A1030),
-                          fontSize: 15 * ds,
-                          fontWeight: FontWeight.w800,
+                      // 极端比分（如 16万 vs 111万）时粉段宽度只有 15%，
+                      // 6 位数字会被裁掉左侧几位；用 FittedBox(scaleDown)
+                      // 在超宽时自动缩字号，文字总能完整显示
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          '$leftScore',
+                          maxLines: 1,
+                          softWrap: false,
+                          style: TextStyle(
+                            color: const Color(0xFF8A1030),
+                            fontSize: 15 * ds,
+                            fontWeight: FontWeight.w800,
+                          ),
                         ),
                       ),
                     ),
@@ -548,12 +579,18 @@ class DouyinPkBar extends StatelessWidget {
                       ),
                       alignment: Alignment.centerRight,
                       padding: EdgeInsets.only(right: 10 * ds),
-                      child: Text(
-                        '$rightScore',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 15 * ds,
-                          fontWeight: FontWeight.w800,
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerRight,
+                        child: Text(
+                          '$rightScore',
+                          maxLines: 1,
+                          softWrap: false,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 15 * ds,
+                            fontWeight: FontWeight.w800,
+                          ),
                         ),
                       ),
                     ),
@@ -757,6 +794,25 @@ List<_PkCell> _fiveCells(List<LivePkSide> ordered) {
 ///   其他（6 人等）   → 均匀网格（列数按人数推断）
 List<_PkCell> _layoutCells(LivePkState s) {
   final n = s.count;
+  // SEI 精确格位优先（服务端随视频流下发的权威坐标，2026-09-19）：
+  // 有坐标的成员直接按百分比铺格，不再套人数模板——模板对 3 人
+  // （左大格0.5x0.5+右列两小格）这类构图永远猜不准。≥2 人有坐标
+  // 即整体采用；个别缺坐标的成员跳过（宁缺勿错，比错位好排查）
+  final seatCells = <_PkCell>[];
+  for (final p in s.participants) {
+    if (p.seatX != null && p.seatY != null && p.seatW != null && p.seatH != null) {
+      seatCells.add(_PkCell(
+        p,
+        left: p.seatX!,
+        top: p.seatY!,
+        width: p.seatW!,
+        height: p.seatH!,
+      ));
+    }
+  }
+  if (seatCells.length >= 2) {
+    return seatCells;
+  }
   if (n == 2) {
     // 2 人：本房主播固定在左（用户口径），对手在右；
     // 放大（画中画）时：本房全屏大画面、对手右下小窗（实测构图）

@@ -605,6 +605,138 @@ class DouyinSite implements LiveSite {
     }
   }
 
+  /// 连麦名册 HTTP 接口（网页版 PKViewPlugin 的 getPKList 同款桥，
+  /// 2026-09-18 逆向确认）：GET /webcast/linkmic/list/?anchor_id=<uid>，
+  /// 响应 data.user[] 每项含 user.id_str（uid）与 linkmic_id_str
+  /// （与 SEI grids.uid_str 同一命名空间）。WS 不推 LinkMessage 的房间
+  /// 靠它补齐 linkmic_id↔uid 映射，SEI 座位表才能全房间生效。
+  /// 失败静默返回空表，不影响主流程。
+  Future<List<Map<String, String>>> fetchLinkmicList({
+    required String anchorId,
+    String? roomId,
+    String? userUniqueId,
+    String referer = kDefaultReferer,
+  }) async {
+    final stopwatch = Stopwatch()..start();
+    try {
+      var uri = Uri.parse("https://live.douyin.com/webcast/linkmic/list/").replace(
+        scheme: "https",
+        port: 443,
+        queryParameters: {
+          "aid": '6383',
+          "app_name": "douyin_web",
+          "live_id": '1',
+          "device_platform": "web",
+          "did_rule": "3",
+          "endpoint": "live_pc",
+          "support_wrds": "1",
+          "enter_from": "link_share",
+          "cookie_enabled": "true",
+          "screen_width": "2560",
+          "screen_height": "1440",
+          "browser_language": "zh-CN",
+          "browser_platform": "Win32",
+          "browser_name": "Chrome",
+          "browser_version": "125.0.0.0",
+          "browser_online": "true",
+          "engine_name": "Blink",
+          "engine_version": "125.0.0.0",
+          "os_name": "Windows",
+          "os_version": "10",
+          "cpu_core_num": "16",
+          "device_memory": "8",
+          "platform": "PC",
+          "downlink": "10",
+          "effective_type": "4g",
+          "round_trip_time": "50",
+          "channel": "channel_pc_web",
+          "webid": userUniqueId ?? "",
+          "device_id": userUniqueId ?? "",
+          "user_unique_id": userUniqueId ?? "",
+          "room_id": roomId ?? "",
+          "anchor_id": anchorId,
+          "msToken": "",
+        },
+      );
+      var requestUrl = DouyinSign.getAbogusUrl(uri.toString(), kDefaultUserAgent);
+      var result = await HttpClient.instance.getJson(
+        requestUrl,
+        header: _newRequestHeaders(
+          cookieValue: _playbackCookie(),
+          referer: referer,
+        ),
+      );
+      _logElapsed("fetchLinkmicList($anchorId)", stopwatch);
+      if (result is! Map) return const [];
+      var data = result["data"];
+      // 诊断：空结果/异常信封时把原始结构写进 pk 日志（ROSTER 行由 controller 打）
+      void dumpDiag(String why) {
+        try {
+          final keys = data is Map
+              ? data.keys.take(12).join(',')
+              : (data is List ? 'List(${data.length})' : '${data.runtimeType}');
+          var raw = '';
+          try {
+            raw = json.encode(result);
+          } catch (_) {
+            raw = '$data';
+          }
+          if (raw.length > 200) raw = raw.substring(0, 200);
+          File('${Directory.systemTemp.path}/simple_live_pk_debug.log')
+              .writeAsStringSync(
+            '${DateTime.now().toIso8601String()} ROSTER-DIAG $why '
+            'status=${result["status_code"]} dataKeys=[$keys] raw=$raw\n',
+            mode: FileMode.append,
+          );
+        } catch (_) {}
+      }
+      // 容错：data.user 或 data.data[0].user（不同版本信封）
+      List? users;
+      if (data is Map && data["user"] is List) {
+        users = data["user"] as List;
+      } else if (data is List && data.isNotEmpty && data.first is Map) {
+        final u = (data.first as Map)["user"];
+        if (u is List) users = u;
+      }
+      if (users == null) {
+        dumpDiag('no-user-list');
+        return const [];
+      }
+      if (users.isEmpty) {
+        dumpDiag('user-list-empty');
+        return const [];
+      }
+      final rows = <Map<String, String>>[];
+      for (final e in users) {
+        if (e is! Map) continue;
+        final linkmic = (e["linkmic_id_str"] ?? '').toString();
+        final u = e["user"];
+        var uid = '';
+        var nick = '';
+        if (u is Map) {
+          uid = (u["id_str"] ?? u["webcast_uid"] ?? '').toString();
+          // 名册自带昵称（网页版同一来源）：免 HTTP 逐个查、无视流控
+          nick = (u["nick_name"] ?? u["nickname"] ?? '').toString();
+        }
+        if (linkmic.isEmpty || uid.isEmpty) continue;
+        rows.add({'linkmic': linkmic, 'uid': uid, 'nick': nick});
+      }
+      _logDebug("fetchLinkmicList: ${rows.length} 条名册");
+      return rows;
+    } catch (e) {
+      _logDebug("fetchLinkmicList 失败（忽略）：$e");
+      try {
+        File('${Directory.systemTemp.path}/simple_live_pk_debug.log')
+            .writeAsStringSync(
+          '${DateTime.now().toIso8601String()} ROSTER-DIAG exception: '
+          '${e.toString().substring(0, e.toString().length.clamp(0, 180))}\n',
+          mode: FileMode.append,
+        );
+      } catch (_) {}
+      return const [];
+    }
+  }
+
   /// 通过roomId获取直播间信息
   /// - [roomId] 直播间ID
   /// - 返回直播间信息

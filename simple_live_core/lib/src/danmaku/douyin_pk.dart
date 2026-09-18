@@ -1,5 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+
+import 'douyin_sei.dart';
 
 // ============================================================================
 // 抖音直播 PK 分数 / 进度条 解析与状态跟踪   v2（支持多人团战）
@@ -128,6 +131,13 @@ class LivePkSide {
   /// 同队成员携带同一个队伍总分值；0 = 无队伍分（个人赛 / 未同步）
   final int teamScore;
 
+  /// SEI 精确格位（0~1，相对合成视频）：有值时 UI 直接按百分比铺格，
+  /// 不再套人数模板。来自视频流 app_data.grids（服务端权威，2026-09-18）
+  final double? seatX;
+  final double? seatY;
+  final double? seatW;
+  final double? seatH;
+
   const LivePkSide({
     required this.userId,
     required this.nickname,
@@ -136,6 +146,10 @@ class LivePkSide {
     this.rank = 0,
     this.teamId = 0,
     this.teamScore = 0,
+    this.seatX,
+    this.seatY,
+    this.seatW,
+    this.seatH,
   });
 }
 
@@ -663,6 +677,9 @@ class DouyinPkTracker {
     _nLastSeen.clear();
     _nBattleIdStr = null;
     _nPhase = 0;
+    _punishStartedAtMs = 0;
+    _punishExpireTimer?.cancel();
+    _punishExpireTimer = null;
     _nStartMs = 0;
     _nDurSec = 0;
     _nSawScores = false;
@@ -675,6 +692,17 @@ class DouyinPkTracker {
     _ringStreak = 0;
     _linkMembers.clear();
     _linkMembersAt = 0;
+    _seiSeat.clear();
+    _seiFocusUid = 0;
+    _seiFocusIsLocal = false;
+    _slotByUid.clear();
+    _uidByLinkmicId.clear();
+    _linkmicIdByUid.clear();
+    _lastSeiSig = '';
+    _seiDebug = '';
+    _seiSlotCycle = const [];
+    _lastSeiLayout = null;
+    _lastSeiLayoutAtMs = 0;
   }
 
   void _emit() {
@@ -786,6 +814,9 @@ class DouyinPkTracker {
       _nStartMs = start ?? 0;
       _nDurSec = dur ?? 0;
       _nPhase = 0;
+      _punishStartedAtMs = 0;
+      _punishExpireTimer?.cancel();
+      _punishExpireTimer = null;
     }
 
     // user_infos 与最新连麦名单快照交叉校验：名单（≥2 人且新鲜）没有
@@ -1106,6 +1137,136 @@ class DouyinPkTracker {
   /// user_scores 几乎总是先到，座位被丢掉（2026-09-14 三轮 6 人证伪）
   final Map<int, int> _uiSeat = <int, int>{};
 
+  /// 视频流 SEI 槽位表：slot -> uid（ douyin_sei.dart 解析 app_data.grids，
+  /// uid 经 linkmic_id 映射回 uid）。服务端随视频帧下发的权威格位，
+  /// 含精确坐标与放大者（focus_id）。2026-09-18 真实流验证通过。
+  final Map<int, int> _seiSeat = <int, int>{};
+  int _seiFocusUid = 0; // SEI focus_id 映射出的放大者 uid（0=无）
+  bool _seiFocusIsLocal = false; // 放大者是否本房主播
+
+  /// WS 侧槽位号备份：uid -> user_position（WebcastLinkMessage.ListUser.f6，
+  /// 部分房间下发；服务端离场全量重编号）。优先级低于 SEI
+  final Map<int, int> _slotByUid = <int, int>{};
+
+  /// uid -> linkmic_id（"1_xxx"，WebcastLinkMessage.ListUser.f2 /
+  /// LinkMicMethod.f45.user.linkmic_id_str），用于把 SEI grids 的 uid_str
+  /// 映射回 uid
+  final Map<int, String> _linkmicIdByUid = <int, String>{};
+
+  /// linkmic_id -> uid（SEI grids.uid_str 反查）
+  final Map<String, int> _uidByLinkmicId = <String, int>{};
+
+  void _indexLinkmicId(int uid, String linkmicId) {
+    _linkmicIdByUid[uid] = linkmicId;
+    _uidByLinkmicId[linkmicId] = uid;
+  }
+
+  /// SEI 布局入库（douyin_sei_stream 回调触发）。
+  /// linkmic_id → uid 映射齐全的格子才写入 _seiSeat；至少映射出 2 人
+  /// 且（有放大者或坐标与现有顺序冲突）才触发重排。
+  /// 无映射的房间（不推 LinkMessage/f45）：丢弃座位但保留"人数+几何+
+  /// 放大态"供诊断；内容未变时直接忽略（节流——SEI 每秒可多条）
+  void applySeiLayout(SeiLayout layout) {
+    _lastSeiLayout = layout;
+    _lastSeiLayoutAtMs = nowMs;
+    // 节流：签名未变直接跳过（slot/坐标/round(focus)）
+    final sig = [
+      for (final g in layout.grids)
+        '${g.slot}:${g.x.toStringAsFixed(3)},${g.y.toStringAsFixed(3)},${g.w.toStringAsFixed(3)},${g.h.toStringAsFixed(3)}',
+      layout.focusLinkmicId,
+    ].join('|');
+    if (sig == _lastSeiSig) return;
+    _lastSeiSig = sig;
+
+    var changed = false;
+    final seat = <int, int>{};
+    for (final g in layout.grids) {
+      final uid = _uidByLinkmicId[g.linkmicId];
+      if (uid != null && uid != 0) {
+        seat[g.slot] = uid;
+      }
+    }
+    if (seat.length >= 2) {
+      _seiSeat
+        ..clear()
+        ..addAll(seat);
+      changed = true;
+    }
+    // focus 映射
+    int focusUid = 0;
+    if (layout.focusLinkmicId.isNotEmpty) {
+      focusUid = _uidByLinkmicId[layout.focusLinkmicId] ?? 0;
+    }
+    final newFocusLocal = _nLocalId != 0 && focusUid == _nLocalId;
+    if (focusUid != _seiFocusUid || newFocusLocal != _seiFocusIsLocal) {
+      _seiFocusUid = focusUid;
+      _seiFocusIsLocal = newFocusLocal;
+      changed = true;
+    }
+    _seiDebug =
+        'grids=${layout.grids.length} mapped=${seat.length} focusMapped=$focusUid';
+    _seiGridCount = layout.grids.length;
+    _seiOwnerSlot = layout.ownerSlot;
+    // grids 数组序（非 p 排序）：疑似服务端加入序，与环序同源，
+    // 是无 linkmic_id 房间的对齐桥梁（2026-09-18 八人房数组序 0,4,1,... 实证非槽位序）
+    _seiSlotCycle = [for (final g in layout.grids) g.slot];
+    if (!changed) return;
+    _rebuildNew();
+  }
+
+  String _lastSeiSig = '';
+  String _seiDebug = '';
+
+  /// SEI 几何模式输入（无需 linkmic 映射）：grids 数量与
+  /// anchor_interact_info.owner_index（本房主播的槽位，-1=未知）
+  int _seiGridCount = 0;
+  int _seiOwnerSlot = -1;
+
+  /// SEI grids 数组序（按收到顺序的槽位序列，疑似服务端加入序：
+  /// 与环序同源——环序第 k 人 → 数组第 k 格的槽位）
+  List<int> _seiSlotCycle = const [];
+
+  /// 最近一次 SEI 布局（名册晚到时立即回补映射）
+  SeiLayout? _lastSeiLayout;
+  int _lastSeiLayoutAtMs = 0; // 最近布局到达时刻（新鲜度门控）
+
+  /// 连麦名册（HTTP /webcast/linkmic/list/，网页版 getPKList 同款身份桥）：
+  /// 喂 linkmic_id↔uid 映射后立即用缓存 SEI 布局回建 _seiSeat。
+  /// rows 元素形如 {linkmic: '1_xxx', uid: '12345'}
+  void applyLinkmicList(List<Map<String, String>> rows) {
+    var changed = false;
+    for (final r in rows) {
+      final linkmic = r['linkmic'];
+      final uid = int.tryParse(r['uid'] ?? '');
+      if (linkmic == null || linkmic.isEmpty || uid == null || uid == 0) continue;
+      if (_uidByLinkmicId[linkmic] != uid) {
+        _indexLinkmicId(uid, linkmic);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    // 名册到齐立刻回建 SEI 座位（绕过节流，不等下一条 SEI）
+    final layout = _lastSeiLayout;
+    if (layout != null) {
+      _lastSeiSig = '';
+      applySeiLayout(layout);
+    } else {
+      _rebuildNew();
+    }
+  }
+
+  /// 诊断：SEI 旁路状态（STATE 日志行）
+  String get debugSeiState =>
+      'seat=${_seiSeat.length}${_seiSeatReady ? "(生效)" : ""} ownerSlot=$_seiOwnerSlot grids=$_seiGridCount sig=${_lastSeiSig.length > 60 ? _lastSeiSig.substring(0, 60) : _lastSeiSig} $_seiDebug';
+
+  /// SEI 布局是否可用（≥2 人已映射）
+  /// SEI 座位是否可用：≥2 人已映射 且 布局新鲜（SEI 随视频流持续下发，
+  /// ~2s 一条；停更 90s = 流断了/连线结束了，座位作废让退出清场路径
+  /// 能正常生效，徽章不会冻结在失效几何上）
+  bool get _seiSeatReady =>
+      _seiSeat.length >= 2 &&
+      nowMs - _lastSeiLayoutAtMs < 90000;
+
   /// 手动调整的格子顺序：用户点选交换的 uid 对（按操作顺序），当前
   /// 战局内持久生效（换局/清场即清）。应用于 _rebuildNew 的 ids 终序
   final List<List<int>> _manualSwapPairs = <List<int>>[];
@@ -1129,6 +1290,8 @@ class DouyinPkTracker {
   bool _nSawScores = false;
   final Map<int, int> _nLastSeen = <int, int>{}; // uid -> 最后出现在同步里的时刻
   int _nPunishSec = 0;
+  int _punishStartedAtMs = 0; // 惩罚开始墙钟（endpunish 时刻）
+  Timer? _punishExpireTimer; // 惩罚窗口到期主动清场（WS 已停时唯一触发源）
   bool _nActive = false;
 
   /// 回退格子顺序：本房优先（位于 0 号格）；其余按名次升序
@@ -1508,6 +1671,7 @@ class DouyinPkTracker {
   void onBattleEndPunish(List<int> payload) {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     _nPhase = 2;
+    _punishStartedAtMs = nowMs;
     // 若原战斗时长未知（_nDurSec==0）或被服务端提前终止，用 nowMs
     // 作为 punishStart 锚点；否则保留原 _nStartMs + _nDurSec*1000 作为
     // "战斗应结束时刻"，但 punish 窗口从 nowMs 起算
@@ -1516,6 +1680,21 @@ class DouyinPkTracker {
       _nDurSec = 0; // 条不再显示倒计时，仅显示「PK 结束」文字
     }
     // punishDurationMs 由 UI 用 _nPunishSec 或兜底 60s
+    // 惩罚 60s 走完 = PK 全部结束：自动清场。WS 消息此时往往已停
+    // （2026-09-19 实测：惩罚结束后主播换位/回普通连麦，无人触发
+    // _rebuildNew，徽章冻结在旧位置被用户截图），必须用定时器主动清
+    _punishExpireTimer?.cancel();
+    final window =
+        Duration(seconds: _nPunishSec > 0 ? _nPunishSec + 3 : 63);
+    _punishExpireTimer = Timer(window, () {
+      if (_nPhase == 2) {
+        // 惩罚走完进入结束态：PK 条/倒计时由 UI 的 pkOver 隐藏，
+        // 参与者与名字徽章保留（用户口径 2026-09-19：PK 结束后名字
+        // 要留着），继续跟随 SEI 几何（主播仍在连线时布局变化跟随）
+        _nPhase = 3;
+        _rebuildNew();
+      }
+    });
     _rebuildNew();
   }
 
@@ -1528,6 +1707,8 @@ class DouyinPkTracker {
   /// 持续挂着近一分钟。found 为空或不含现存 uid 即视为退出 → 立刻清
   void onLinkMessage(List<int> payload) {
     final found = <int, String>{};
+    final positions = <int, int>{}; // uid -> user_position（部分房间下发）
+    final linkmicIds = <int, String>{}; // uid -> linkmic_id_str（SEI 映射用）
     final r = PbReader(payload);
     r.forEachField((f, w) {
       if (f == 13 && w == 2) {
@@ -1537,18 +1718,50 @@ class DouyinPkTracker {
             final u = PbReader(grp.readBytes());
             int? uid;
             String? nick;
+            String? linkmicId;
+            int? position;
             u.forEachField((uf, uw) {
-              if (uf == 1 && uw == 0) {
-                uid = u.readVarint();
+              if (uf == 1 && uw == 2) {
+                // ListUser.user -> User{1: uid(varint), 3: nickname}
+                final user = PbReader(u.readBytes());
+                user.forEachField((bf, bw) {
+                  if (bf == 1 && bw == 0) {
+                    uid = user.readVarint();
+                    return true;
+                  }
+                  if (bf == 3 && bw == 2) {
+                    nick = user.readString();
+                    return true;
+                  }
+                  return false;
+                });
+                return true;
+              }
+              if (uf == 2 && uw == 2) {
+                try {
+                  linkmicId = u.readString();
+                } catch (_) {}
                 return true;
               }
               if (uf == 3 && uw == 2) {
-                nick = u.readString();
+                try {
+                  linkmicId ??= u.readString();
+                } catch (_) {}
+                return true;
+              }
+              if (uf == 6 && uw == 0) {
+                position = u.readVarint();
                 return true;
               }
               return false;
             });
-            if (uid != null && uid != 0) found[uid!] = nick ?? '';
+            if (uid != null && uid != 0) {
+              found[uid!] = nick ?? '';
+              if (position != null) positions[uid!] = position!;
+              if (linkmicId != null && linkmicId!.isNotEmpty) {
+                linkmicIds[uid!] = linkmicId!;
+              }
+            }
             return true;
           }
           return false;
@@ -1557,6 +1770,14 @@ class DouyinPkTracker {
       }
       return false;
     });
+    if (positions.isNotEmpty) {
+      _slotByUid
+        ..clear()
+        ..addAll(positions);
+    }
+    if (linkmicIds.isNotEmpty) {
+      linkmicIds.forEach(_indexLinkmicId);
+    }
     if (found.isEmpty) return _onLinkMessageHeuristic(payload);
     _applyLinkUsers(found);
   }
@@ -1667,6 +1888,7 @@ class DouyinPkTracker {
   void _maybeClearOnLinkExit() {
     if (_nTotals.isEmpty) return;
     if (_nPhase == 2) return; // 惩罚阶段保留窗口
+    if (_seiSeatReady) return; // SEI 座位仍生效 = 连线仍在，名字保留跟随
     if (!_battleFinished()) return; // 进行中不动
     _clearParticipants();
   }
@@ -1713,7 +1935,9 @@ class DouyinPkTracker {
     if (_nPhase >= 3) return true;
     if (_nPhase == 2) return false; // Punish 阶段不视为结束
     if (_nStartMs <= 0 || _nDurSec <= 0) return false;
-    final now = DateTime.now().millisecondsSinceEpoch;
+    // 用服务端校准时钟（nowMs）：裸 DateTime.now 在本机时钟偏移时会让
+    // 结束判定漂移；也让旧抓包回归夹具必过期（2026-09-18 发现）
+    final now = nowMs;
     final grace = _nPunishSec > 0 ? _nPunishSec * 1000 : 60000;
     return now >= _nStartMs + _nDurSec * 1000 + grace;
   }
@@ -1740,8 +1964,11 @@ class DouyinPkTracker {
   }
 
   void _rebuildNew() {
-    // 战局已结束：清掉残留参与者并发出空状态（此前徽章会一直挂着）
-    if (_nTotals.isNotEmpty && _battleFinished()) {
+    // 战局已结束：默认清掉残留参与者并发出空状态（此前徽章会一直挂着）。
+    // 例外：SEI 座位仍生效 = 主播还在连线（PK 结束后连麦继续），名字
+    // 徽章要保留并跟随新布局（用户口径 2026-09-19：PK 结束后名字要留着）。
+    // SEI 断供/连线真正退出时 _seiSeat 会在 applySeiLayout/清场路径消失
+    if (_nTotals.isNotEmpty && _battleFinished() && !_seiSeatReady) {
       _clearParticipants();
       return;
     }
@@ -1759,7 +1986,14 @@ class DouyinPkTracker {
     // 无座位时本房排 idx0（2026-09-14 乱斗实测）。
     final bool seated;
     final List<int> ids;
-    if (_seatOrder.isNotEmpty) {
+    if (_seiSeatReady) {
+      // SEI 权威格位（视频流下发，2026-09-18 实流验证）：槽位即格子
+      seated = true;
+      final seatIds = [
+        for (final p in _seiSeat.keys.toList()..sort()) _seiSeat[p]!,
+      ];
+      ids = [...seatIds, for (final u in _nOrder) if (!seatIds.contains(u)) u];
+    } else if (_seatOrder.isNotEmpty) {
       seated = true;
       final seatIds = [
         for (final p in _seatOrder.keys.toList()..sort()) _seatOrder[p]!,
@@ -1771,6 +2005,48 @@ class DouyinPkTracker {
         for (final p in _uiSeat.keys.toList()..sort()) _uiSeat[p]!,
       ];
       ids = [...seatIds, for (final u in _nOrder) if (!seatIds.contains(u)) u];
+    } else if (_slotByUid.length >= 2 &&
+        _slotByUid.keys.any(_nTotals.containsKey)) {
+      // WS 槽位号（ListUser.user_position，部分房间下发）：SEI 不可用时的
+      // 座位备份。槽位 0 通常是本房主播；只对当前参与者排序，离场重编号
+      // 由每次 LinkMessage 全量刷新 _slotByUid 承接
+      seated = true;
+      final active = _slotByUid.entries
+          .where((e) => _nTotals.containsKey(e.key))
+          .toList()
+        ..sort((a, b) => a.value.compareTo(b.value));
+      final seatIds = active.map((e) => e.key).toList();
+      ids = [...seatIds, for (final u in _nOrder) if (!seatIds.contains(u)) u];
+    } else if (_seiSlotCycle.length >= 2 &&
+        _seiGridCount >= 2 &&
+        _nOrder.isNotEmpty &&
+        _nOrder.length == _seiGridCount) {
+      // SEI 几何模式（无需 linkmic_id 映射，2026-09-18 八人房验证需求）。
+      // grids 数组序 = 服务端加入序（与环序同源，实证非槽位排序）：
+      // 环序/首见序第 k 人 → 数组第 k 格的槽位 p。ownerSlot 只用于
+      // 校验（数组中本房槽位应与环序本房位置一致）
+      seated = false;
+      final base = _ringRotatedToLocal() ??
+          [
+            _nLocalId,
+            for (final u in _nOrder)
+              if (u != _nLocalId) u,
+          ];
+      if (base.length == _seiSlotCycle.length) {
+        // 数组序按 owner 槽位对齐（owner 即本房主播 = 环序起点 local）；
+        // ownerSlot 未知/不在数组中时按数组原序（推测 owner 恒为首个加入者）
+        final n = _seiSlotCycle.length;
+        final j = _seiOwnerSlot >= 0 ? _seiSlotCycle.indexOf(_seiOwnerSlot) : 0;
+        // 产出"槽位 -> uid"，再按槽位排序即画面序
+        final slotToUid = <int, int>{};
+        for (var k = 0; k < n; k++) {
+          slotToUid[_seiSlotCycle[(j + k) % n]] = base[k];
+        }
+        final slots = slotToUid.keys.toList()..sort();
+        ids = [for (final s in slots) slotToUid[s]!];
+      } else {
+        ids = List<int>.of(base);
+      }
     } else if (_nOrder.isNotEmpty && _nLocalId != 0 &&
         _nOrder.contains(_nLocalId)) {
       seated = false;
@@ -1820,6 +2096,21 @@ class DouyinPkTracker {
     }
     final parts = <LivePkSide>[];
     for (final id in ids) {
+      // SEI 精确几何：linkmic_id 映射到 uid 且有缓存布局时透传百分比坐标，
+      // UI 按 seatX/Y/W/H 直接铺格（人数模板退化为无 SEI 时的兜底）
+      double? sx, sy, sw, sh;
+      final lm = _linkmicIdByUid[id];
+      if (lm != null) {
+        for (final g in _lastSeiLayout?.grids ?? const <SeiGrid>[]) {
+          if (g.linkmicId == lm) {
+            sx = g.x;
+            sy = g.y;
+            sw = g.w;
+            sh = g.h;
+            break;
+          }
+        }
+      }
       parts.add(LivePkSide(
         userId: id,
         nickname: _nNames[id] ?? '主播${id % 1000}',
@@ -1827,6 +2118,10 @@ class DouyinPkTracker {
         rank: _nRank[id] ?? 0,
         teamId: _nAnchorTeam[id] ?? 0,
         teamScore: _nTeamScore[id] ?? 0,
+        seatX: sx,
+        seatY: sy,
+        seatW: sw,
+        seatH: sh,
       ));
     }
     if (parts.isEmpty) {
@@ -1892,6 +2187,8 @@ class DouyinPkTracker {
       punishStartMs: _nStartMs + _nDurSec * 1000,
       teamBattle: _nHasTeamScores,
       localUserId: _nLocalId,
+      // 放大者只信 EnlargeGuest 消息/详情 enlarge_guest；SEI focus_id 已证伪
+      // （同一 id 跨房间恒定，非"被放大者"，2026-09-18），仅供诊断不参与渲染
       enlargedUserId: _nEnlargedUid,
       bigMode: _nPipMode,
       pipMode: _nPipMode && parts.length == 2,

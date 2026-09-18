@@ -97,6 +97,14 @@ class LiveRoomController extends PlayerController
   var online = 0.obs;
   var followed = false.obs;
   var liveStatus = false.obs;
+  /// PK 覆盖层显隐开关（默认 ON，仅本次会话生效）
+  final showPkOverlay = true.obs;
+
+  /// PK 层内「直播间标题」显隐开关（默认 ON，仅本次会话生效）
+  final showPkTitle = true.obs;
+
+  /// PK 层内「观看人数角标」显隐开关（默认 ON，仅本次会话生效）
+  final showPkViewerCount = true.obs;
   RxList<LiveSuperChatMessage> superChats = RxList<LiveSuperChatMessage>();
   RxList<LiveContributionRankItem> contributionRanks =
       RxList<LiveContributionRankItem>();
@@ -1508,9 +1516,80 @@ class LiveRoomController extends PlayerController
       dm.pkTracker.setLocalNicknameHint(detail.value?.userName ?? '');
       // 放大（画中画）状态随详情加载注入
       dm.pkTracker.setPipMode(detail.value?.enlargeGuest ?? false);
+      // 连麦名册（HTTP /webcast/linkmic/list/，网页版身份桥）：
+      // 进房拉一次补齐 linkmic_id↔uid 映射，SEI 座位在所有房间生效
+      unawaited(_fetchLinkmicRoster(dm));
+      // SEI 旁路 URL 失效（PK 结束流轮换等）：重新解析播放地址并重启旁路
+      dm.onSeiGiveUp = () {
+        unawaited(_refreshSeiUrl());
+      };
     } else {
       pkState.value = null;
     }
+  }
+
+  /// SEI 旁路 URL 刷新：静默重取播放地址（不动 mpv 正在播的流），
+  /// 换新 URL 重启旁路。失败静默（下一局进房会重建）
+  Future<void> _refreshSeiUrl() async {
+    try {
+      if (!await _reloadPlayUrls(silent: true)) return;
+      final flv = playUrls.firstWhere((u) => u.contains('.flv'), orElse: () => '');
+      if (flv.isNotEmpty && liveDanmaku is DouyinDanmaku) {
+        _pkDebugLog('SEI-REFRESH url=${flv.substring(0, flv.length.clamp(0, 60))}');
+        (liveDanmaku as DouyinDanmaku).updateSeiFlvUrl(flv);
+      }
+    } catch (_) {}
+  }
+
+  /// 抖音连麦名册拉取（失败静默；SEI 格位晚到时也能补建映射）
+  Future<void> _fetchLinkmicRoster(DouyinDanmaku dm) async {
+    try {
+      final d = detail.value;
+      final ls = site.liveSite;
+      if (d == null || ls is! DouyinSite) return;
+      final anchorId = d.ownerId;
+      if (anchorId.isEmpty) return;
+      final args = d.danmakuData;
+      final dmArgs = args is DouyinDanmakuArgs ? args : null;
+      final rows = await ls.fetchLinkmicList(
+        anchorId: anchorId,
+        roomId: dmArgs?.roomId,
+        userUniqueId: dmArgs?.userId,
+        referer: d.url,
+      );
+      if (rows.isNotEmpty) {
+        dm.pkTracker.applyLinkmicList(rows);
+        // 名册自带昵称：一次回填全部真名（HTTP 逐个查有 3 个/轮流控）
+        final names = <int, String>{};
+        for (final r in rows) {
+          final uid = int.tryParse(r['uid'] ?? '');
+          final nick = r['nick'] ?? '';
+          if (uid != null && uid > 0 && nick.isNotEmpty) {
+            names[uid] = nick;
+          }
+        }
+        if (names.isNotEmpty) {
+          dm.pkTracker.applyNicknames(names);
+          _pkDebugLog('ROSTER nicks=${names.length}');
+        }
+        _pkDebugLog('ROSTER ok anchor=$anchorId rows=${rows.length}');
+      } else {
+        _pkDebugLog('ROSTER empty anchor=$anchorId');
+      }
+    } catch (e) {
+      _pkDebugLog('ROSTER fail: $e');
+    }
+  }
+
+  /// SEI 旁路诊断：无条件写 pk_debug 日志（Log.d 在 Release 不可见）
+  void _pkDebugLog(String msg) {
+    try {
+      File('${Directory.systemTemp.path}/simple_live_pk_debug.log')
+          .writeAsStringSync(
+        '${DateTime.now().toIso8601String()} $msg\n',
+        mode: FileMode.append,
+      );
+    } catch (_) {}
   }
 
   /// 解析房间详情里的连麦座位表（linker_map：位置->room_id）并推给 PK 跟踪器
@@ -1909,6 +1988,22 @@ class LiveRoomController extends PlayerController
     }
     playUrls.value = playUrl.urls;
     playHeaders = playUrl.headers;
+    // 抖音：把 FLV 地址注入弹幕层启动 SEI 旁路（连麦格位/放大者解析，
+    // 2026-09-18）。画质/线路解析晚于弹幕启动，这里补传；
+    // 换 URL 时 danmaku 内部自重启旁路连接
+    try {
+      final danmaku = liveDanmaku;
+      final isFlv = playUrl.urls.where((u) => u.contains('.flv')).toList();
+      _pkDebugLog(
+          'SEI-INJECT site=${site.id} douyin=${site.id == Constant.kDouyin} '
+          'isDouyinDm=${danmaku is DouyinDanmaku} urls=${playUrl.urls.length} '
+          'flvUrls=${isFlv.length} url0=${playUrl.urls.isEmpty ? "-" : playUrl.urls.first.substring(0, playUrl.urls.first.length.clamp(0, 80))}');
+      if (site.id == Constant.kDouyin && danmaku is DouyinDanmaku) {
+        if (isFlv.isNotEmpty) {
+          danmaku.updateSeiFlvUrl(isFlv.first);
+        }
+      }
+    } catch (_) {}
     if (resetLine || currentLineIndex < 0) {
       currentLineIndex = 0;
     } else if (currentLineIndex >= playUrls.length) {
@@ -2314,6 +2409,21 @@ class LiveRoomController extends PlayerController
     );
     followed.value = true;
     EventBus.instance.emit(Constant.kUpdateFollow, id);
+  }
+
+  /// 切换 PK 覆盖层（PK 条 + PK 名字格子）显隐，仅本次会话生效
+  void togglePkOverlay() {
+    showPkOverlay.value = !showPkOverlay.value;
+  }
+
+  /// 切换 PK 层内「直播间标题」显隐，仅本次会话生效
+  void togglePkTitle() {
+    showPkTitle.value = !showPkTitle.value;
+  }
+
+  /// 切换 PK 层内「观看人数角标」显隐，仅本次会话生效
+  void togglePkViewerCount() {
+    showPkViewerCount.value = !showPkViewerCount.value;
   }
 
   /// 在直播间给当前主播设置关注标签。
