@@ -802,7 +802,10 @@ class LiveRoomPage extends GetView<LiveRoomController> {
         // 不用 Obx 包 player.state：media_kit 状态非 Rx，Obx 会报"无响应式依赖"。
         // 尺寸通过函数提供器在内部 LayoutBuilder / 每秒 ticker 里获取。
         Obx(
-          () => controller.showPkOverlay.value && !pipMode
+          () => (controller.showPkOverlay.value ||
+                  controller.showPkTitle.value ||
+                  controller.showPkViewerCount.value) &&
+              !pipMode
               ? Positioned.fill(
                   child: Obx(
                     // 标题/人数独立开关变化时也要重建 layer（Obx 读 .value）
@@ -820,6 +823,8 @@ class LiveRoomPage extends GetView<LiveRoomController> {
                       // 标题/人数角标独立显隐开关（默认 ON，仅本次会话生效）
                       showTitle: controller.showPkTitle.value,
                       showViewerCount: controller.showPkViewerCount.value,
+                      // PK显示只控制 PK 条/徽章；标题/人数由各自开关独立控制
+                      showPkElements: controller.showPkOverlay.value,
                       // 手动交换：交换模式点选两格后转发到 tracker
                       onManualSwap: (uidA, uidB) {
                         final dm = controller.liveDanmaku;

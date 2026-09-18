@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
@@ -57,6 +58,11 @@ class DouyinPkLayer extends StatefulWidget {
   /// 由外部转发到 pkTracker.registerManualSwap
   final void Function(int uidA, int uidB)? onManualSwap;
 
+  /// PK 元素显隐（PK 条 + 名字徽章 + 交换）。与标题/人数独立——
+  /// 「PK显示」关闭时标题/人数角标仍按各自开关渲染（2026-09-19 用户口径：
+  /// PK显示按钮不应连带控制标题和人数）
+  final bool showPkElements;
+
   const DouyinPkLayer({
     super.key,
     required this.state,
@@ -68,6 +74,7 @@ class DouyinPkLayer extends StatefulWidget {
     this.title = '',
     this.showTitle = true,
     this.showViewerCount = true,
+    this.showPkElements = true,
     this.onManualSwap,
   });
 
@@ -243,11 +250,25 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
           final hasBattle = s.count >= 2 &&
               (s.durationMs > 0 || s.hasScoreFlow) &&
               !pkOver;
-          final scale = (rect.width / 900).clamp(1.0, 2.2);
+          final scale = (rect.width / 900).clamp(1.0, 1.5);
           // 标题/条/角标贴窗口顶部（黑边上，用户口径 2026-09-13）：
           // 不随视频黑边移动，视频内不出现标题。徽章仍贴视频格子。
+          // 2026-09-19 全屏口径：竖屏视频在横屏全屏里，画布带顶
+          // （0.188×高）离窗口顶会很远，PK 条悬在黑边上离格子太远——
+          // 条锚定改为"不低于格带顶上方 68*scale"：小窗口保持原位
+          // （带顶-68 ≈ 原 50），大间隔全屏自动下移贴到格带上沿
           final hasTitle = widget.title.isNotEmpty && widget.showTitle;
-          final barTop = rect.top + 8 * scale + (hasTitle ? 30 * scale : 0);
+          final cellsTopFrac = seiGeometry
+              ? s!.participants
+                  .map((p) => p.seatY)
+                  .whereType<double>()
+                  .reduce((a, b) => a < b ? a : b)
+              : 0.1875;
+          final cellsTopY = rect.top + cellsTopFrac * rect.height;
+          final barTop = math.max(
+            rect.top + 50 * scale,
+            cellsTopY - 68 * scale,
+          );
           // 人数角标与标题同一行（用户口径 2026-09-13：右上角对齐标题），
           // PK 条/倒计时在下一行不与角标重叠
           final badgeTop = rect.top + 8 * scale;
@@ -290,9 +311,11 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
               // 条压真实画面顶边：视频区可能在窗口内嵌着（BoxFit.contain
               // 留黑边），用 _videoRect 算出的 rect.top 就是真实画面顶。
               // 用户口径 2026-09-14：条下移 50 像素看效果
-              if (hasBattle && (s.teamBattle || s.count == 2))
+              if (widget.showPkElements &&
+                  hasBattle &&
+                  (s.teamBattle || s.count == 2))
                 Positioned(
-                  top: rect.top + 50 * scale,
+                  top: barTop,
                   left: rect.left,
                   width: rect.width,
                   child: IgnorePointer(
@@ -303,9 +326,11 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                   ),
                 ),
               // 个人赛：紧凑倒计时（仿抖音「PK 06:51」样式）
-              if (hasBattle && !(s.teamBattle || s.count == 2))
+              if (widget.showPkElements &&
+                  hasBattle &&
+                  !(s.teamBattle || s.count == 2))
                 Positioned(
-                  top: rect.top + 50 * scale,
+                  top: barTop,
                   left: rect.left,
                   width: rect.width,
                   child: IgnorePointer(
@@ -318,7 +343,7 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
               // 格子徽章（count>=2）：叠加在合成画面的格子上。
               // 状态超时 15 秒无更新（对方中途退出连线）时隐去，防徽章挂屏。
               // 交换模式下格子可点击（点选两格互换），其余时候不响应指针
-              if (s.count >= 2 && !stale)
+              if (widget.showPkElements && s.count >= 2 && !stale)
                 Positioned(
                   left: rect.left,
                   // SEI 几何（seatX 等有值）：坐标是画布相对（0~1 对应完整
@@ -361,7 +386,7 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                   ),
                 ),
               // 手动交换开关（左上角 ⇄）：进入交换模式后点选两格互换
-              if (s != null && s.count >= 2 && !stale)
+              if (widget.showPkElements && s != null && s.count >= 2 && !stale)
                 Positioned(
                   left: rect.left + 6 * scale,
                   top: rect.top + 8 * scale,
@@ -390,7 +415,10 @@ class _DouyinPkLayerState extends State<DouyinPkLayer> {
                     ),
                   ),
                 ),
-              if (_swapMode && s != null && s.count >= 2)
+              if (widget.showPkElements &&
+                  _swapMode &&
+                  s != null &&
+                  s.count >= 2)
                 Positioned(
                   left: rect.left + 52 * scale,
                   top: rect.top + 10 * scale,
@@ -1150,7 +1178,7 @@ class DouyinPkGridOverlay extends StatelessWidget {
     final showScoresInBattle = hasBattle && state.count > 2;
     // 徽章随格子大小等比缩放：3x3/4x2 的小格子里徽章变小不溢出
     double cellBadgeScale(_PkCell c) =>
-        ((c.width * width) / 175).clamp(0.55, 1.3).toDouble();
+        ((c.width * width) / 175).clamp(0.55, 1.1).toDouble();
     // 统一名字字号：按当前最长的名字算出共同缩放——全员同字号，
     // 有人名字过长时全员等比缩小（避免个别缩、个别不缩的怪象）
     var nameScale = 1.0;
