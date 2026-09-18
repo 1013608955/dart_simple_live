@@ -703,6 +703,7 @@ class DouyinPkTracker {
     _seiSlotCycle = const [];
     _lastSeiLayout = null;
     _lastSeiLayoutAtMs = 0;
+    _battleStartById.clear();
   }
 
   void _emit() {
@@ -1292,6 +1293,9 @@ class DouyinPkTracker {
   int _nPunishSec = 0;
   int _punishStartedAtMs = 0; // 惩罚开始墙钟（endpunish 时刻）
   Timer? _punishExpireTimer; // 惩罚窗口到期主动清场（WS 已停时唯一触发源）
+
+  /// battleId → start 登记（车轮战换场后识别"旧局状态迟到重播"并丢弃）
+  final Map<String, int> _battleStartById = <String, int>{};
   bool _nActive = false;
 
   /// 回退格子顺序：本房优先（位于 0 号格）；其余按名次升序
@@ -1326,6 +1330,7 @@ class DouyinPkTracker {
 
   /// WebcastBattleStatusMessage：PK 计时与阶段
   void onBattleStatus(List<int> payload) {
+    var battleSwitched = false;
     final r = PbReader(payload);
     r.forEachField((f, w) {
       if (f == 2 && w == 2) {
@@ -1333,23 +1338,38 @@ class DouyinPkTracker {
         // battleId 切换 = 新一局开始，重置 phase/dur/start（防止上一局
         // 的 punish/punish 残留导致"刚开就显示惩罚窗口"。
         // 2026-09-15 8人 4v4 实测：跨局时服务端发的 BattleStatus 带
-        // 旧 phase=punish，让 count=0 时已经停在惩罚阶段
+        // 旧 phase=punish，让 count=0 时已经停在惩罚阶段。
+        // 2026-09-19 车轮战实测：换场后旧局状态还会"迟到重播"——
+        // 已见过的 battleId 且其 start 早于当前局 = 旧局消息迟到，
+        // 整条丢弃，防止把进行中的新局覆盖成"已结束"并清场
         if (_nBattleIdStr != null && newId != _nBattleIdStr) {
+          final knownStart = _battleStartById[newId];
+          if (knownStart != null &&
+              _nStartMs > 0 &&
+              knownStart < _nStartMs) {
+            return false; // 丢弃整条迟到的旧局消息
+          }
           _nPhase = 0;
           _nDurSec = 0;
           _nStartMs = 0;
           _nPunishSec = 0;
           _nActive = false;
+          battleSwitched = true;
         }
         _nBattleIdStr = newId;
         return true;
       }
       if (f == 4 && w == 0) {
         final p = r.readVarint();
-        // Punish 阶段一旦进入（_nPhase=2），后续 BattleStatus 不覆盖
-        // 直到 60s 读完（2026-09-14 实测：Punish 后第一条同步把
-        // _nPhase 重置为 0，导致 60s 窗口消失）
-        if (_nPhase != 2) _nPhase = p;
+        // f4 是服务端权威阶段。唯一保护：同一战局内 punish 窗口不被
+        // 迟到的 running 覆盖（2026-09-14 实测：窗口内迟到 f4=1 会砍掉
+        // 60s 读秒）。跨战局（车轮战换场 battleSwitched）punish→running
+        // 是新局开始的合法流转，必须放行——否则 phase 卡死在 punish，
+        // 新局显示「PK结束 (Ns)」而网页正常显示倒计时（2026-09-19 实测）
+        if (!battleSwitched && _nPhase == 2 && p != 2) {
+          return true;
+        }
+        _nPhase = p;
         return true;
       }
       if (f == 6 && w == 0) {
@@ -1362,6 +1382,11 @@ class DouyinPkTracker {
       }
       if (f == 8 && w == 2) {
         _nStartMs = int.tryParse(r.readString()) ?? 0;
+        // 登记 battleId→start：用于识别车轮战换场后"旧局状态迟到重播"
+        if (_nBattleIdStr != null && _nStartMs > 0) {
+          if (_battleStartById.length > 64) _battleStartById.clear();
+          _battleStartById[_nBattleIdStr!] = _nStartMs;
+        }
         return true;
       }
       if (f == 9 && w == 2) {
